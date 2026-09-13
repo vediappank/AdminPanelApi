@@ -1,0 +1,22 @@
+# VS Studio
+.vs/
+.vscode/
+
+# Build
+bin/
+obj/
+*.dll
+*.exe
+
+# User
+*.user
+*.userprefs
+*.suo
+
+# NuGet
+packages/
+*.nupkg
+
+# Environment
+.env
+*.local

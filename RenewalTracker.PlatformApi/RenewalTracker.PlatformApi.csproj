@@ -1,0 +1,47 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>RenewalTracker.PlatformApi</RootNamespace>
+    <UserSecretsId>renewal-tracker-platform-api-secrets</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Its own Domain/Application/Infrastructure - no reference to the
+         RenewalTracker.Domain/.Application/.Infrastructure Business-side
+         projects at all, the same way platform-admin-ui and
+         renewal-tracker-ui are two separate Angular apps with no shared
+         library between them. See RenewalTracker.Platform.Domain.Entities.Tenant. -->
+    <ProjectReference Include="..\RenewalTracker.Platform.Domain\RenewalTracker.Platform.Domain.csproj" />
+    <ProjectReference Include="..\RenewalTracker.Platform.Application\RenewalTracker.Platform.Application.csproj" />
+    <ProjectReference Include="..\RenewalTracker.Platform.Infrastructure\RenewalTracker.Platform.Infrastructure.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="8.0.0" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="8.0.0">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="Swashbuckle.AspNetCore" Version="6.5.0" />
+    <!-- Request/response + issue logging (see log4net.config,
+         RequestResponseLoggingMiddleware). If restore complains about this
+         exact version, open NuGet Package Manager and install whatever the
+         latest version compatible with net8.0 is - the version pin here is
+         a best guess made without NuGet access. -->
+    <PackageReference Include="log4net" Version="2.0.15" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Log4Net.AspNetCore" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- log4net.config isn't .NET config (no ConfigurationBuilder involved) -
+         it has to be copied next to the built .dll for AddLog4Net("log4net.config")
+         to find it at runtime. -->
+    <None Include="log4net.config">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>
