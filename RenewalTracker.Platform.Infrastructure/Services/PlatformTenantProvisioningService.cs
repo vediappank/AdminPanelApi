@@ -15,6 +15,7 @@ public class PlatformTenantProvisioningService : IPlatformTenantProvisioningServ
     private readonly PlatformDbContext _db;
     private readonly HttpClient _businessApiClient;
     private readonly ILogger<PlatformTenantProvisioningService> _logger;
+    private readonly ITenantDatabaseService _tenantDatabases;
 
     // Temporary decoupling switch: "Provisioning:SkipBusinessApiCall" (see
     // appsettings.Development.json). While true, ProvisionAsync and
@@ -30,8 +31,10 @@ public class PlatformTenantProvisioningService : IPlatformTenantProvisioningServ
         PlatformDbContext db,
         HttpClient businessApiClient,
         ILogger<PlatformTenantProvisioningService> logger,
-        IConfiguration configuration)
+        IConfiguration configuration,
+        ITenantDatabaseService tenantDatabases)
     {
+        _tenantDatabases = tenantDatabases;
         _db = db;
         _businessApiClient = businessApiClient;
         _logger = logger;
@@ -79,18 +82,31 @@ public class PlatformTenantProvisioningService : IPlatformTenantProvisioningServ
             await LogConvertedToTenantFollowUpAsync(leadId);
         }
 
+        await SaveMenuAssignmentsAsync(tenant.TenantId, dto);
+
+        // The tenant's own database - created, schema migrated, master data seeded and the owner
+        // login added - by the background worker, starting now. This call returns at once; the
+        // Control Center shows the progress live. A failure is stored on dbo.TenantDatabases and
+        // retried automatically - it does not undo the tenant.
+        await _tenantDatabases.QueueProvisioningAsync(tenant.TenantId, OwnerOf(dto), SettingsOf(dto));
+
         if (_skipBusinessApiCall)
         {
             return SkippedResult(tenant, dto);
         }
 
-        return await CallBusinessApiAsync(tenant, dto);
+        var result = await CallBusinessApiAsync(tenant, dto);
+        await _tenantDatabases.MarkActiveAsync(tenant.TenantId);
+        return result;
     }
 
     public async Task<ProvisionTenantResultDto> CompleteProvisioningAsync(int tenantId, ProvisionTenantDto dto)
     {
         var tenant = await _db.Tenants.FirstOrDefaultAsync(t => t.TenantId == tenantId);
         if (tenant == null) throw new InvalidOperationException($"Tenant {tenantId} was not found.");
+
+        await SaveMenuAssignmentsAsync(tenant.TenantId, dto);
+        await _tenantDatabases.QueueProvisioningAsync(tenant.TenantId, OwnerOf(dto), SettingsOf(dto));
 
         if (_skipBusinessApiCall)
         {
@@ -101,7 +117,47 @@ public class PlatformTenantProvisioningService : IPlatformTenantProvisioningServ
         // IPlatformTenantProvisioningService) - always safe to re-attempt
         // because the Business side no-ops if this tenant's Roles already
         // exist (see ProvisionBusinessSideAsync's idempotency check).
-        return await CallBusinessApiAsync(tenant, dto);
+        var completed = await CallBusinessApiAsync(tenant, dto);
+        await _tenantDatabases.MarkActiveAsync(tenant.TenantId);
+        return completed;
+    }
+
+    /// <summary>
+    /// Writes dbo.TenantMenuAssignments from dto.MenuItemIds (Provision tenant ▸
+    /// Modules and menus): the ticked menus, every active system menu, and the
+    /// parent of each ticked menu, replacing whatever the tenant had. Unknown or
+    /// inactive ids are ignored. When dto.ModuleIds is not sent, it is filled from
+    /// the chosen menus' ModuleId so the module-based Business-side setup gets the
+    /// same selection. No-op when MenuItemIds is null.
+    /// </summary>
+    private async Task SaveMenuAssignmentsAsync(int tenantId, ProvisionTenantDto dto)
+    {
+        if (dto.MenuItemIds == null) return;
+
+        var menus = await _db.TenantMenuItems.AsNoTracking().Where(m => m.IsActive).ToListAsync();
+        var byId = menus.ToDictionary(m => m.MenuItemId);
+        var chosen = new HashSet<int>(dto.MenuItemIds.Where(byId.ContainsKey));
+        foreach (var m in menus.Where(m => m.IsSystemMenu)) chosen.Add(m.MenuItemId);
+        foreach (var id in chosen.ToList())
+        {
+            var parentId = byId[id].ParentMenuItemId;
+            while (parentId is int pid && byId.TryGetValue(pid, out var parent) && chosen.Add(pid))
+                parentId = parent.ParentMenuItemId;
+        }
+
+        var existing = await _db.TenantMenuAssignments.Where(a => a.TenantId == tenantId).ToListAsync();
+        _db.TenantMenuAssignments.RemoveRange(existing);
+        var now = DateTime.UtcNow;
+        foreach (var id in chosen)
+            _db.TenantMenuAssignments.Add(new TenantMenuAssignment { TenantId = tenantId, MenuItemId = id, CreatedDate = now });
+        await _db.SaveChangesAsync();
+
+        if (dto.ModuleIds == null)
+        {
+            dto.ModuleIds = chosen.Select(id => byId[id].ModuleId).Where(x => x.HasValue).Select(x => x!.Value).Distinct().ToList();
+        }
+
+        _logger.LogInformation("Tenant {TenantId}: {Count} Business Panel menus assigned.", tenantId, chosen.Count);
     }
 
     /// <summary>
@@ -183,6 +239,13 @@ public class PlatformTenantProvisioningService : IPlatformTenantProvisioningServ
     /// warning (not info) every time, specifically so this is never
     /// mistaken for a fully working tenant later.
     /// </summary>
+    private static TenantSettings SettingsOf(ProvisionTenantDto dto) => new(dto.DateFormat, dto.TimeZone, dto.Currency);
+
+    private static TenantOwnerLogin? OwnerOf(ProvisionTenantDto dto) =>
+        string.IsNullOrWhiteSpace(dto.AdminEmail) || string.IsNullOrEmpty(dto.AdminPassword)
+            ? null
+            : new TenantOwnerLogin(dto.AdminFirstName, dto.AdminLastName, dto.AdminEmail, dto.AdminPassword);
+
     private ProvisionTenantResultDto SkippedResult(Tenant tenant, ProvisionTenantDto dto)
     {
         _logger.LogWarning(
@@ -215,6 +278,7 @@ public class PlatformTenantProvisioningService : IPlatformTenantProvisioningServ
             AdminEmail = dto.AdminEmail,
             AdminPassword = dto.AdminPassword,
             ModuleIds = dto.ModuleIds,
+            MenuItemIds = dto.MenuItemIds,
         };
 
         try

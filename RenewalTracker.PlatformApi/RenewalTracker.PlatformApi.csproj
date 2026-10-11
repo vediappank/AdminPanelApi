@@ -44,4 +44,11 @@
     </None>
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Tenant database scripts (..\TenantDatabase\Schema, ..\TenantDatabase\MasterData) are copied
+         next to the built .dll so a deployed API finds them too; while developing, the API reads
+         them straight from the source folder (see TenantDatabaseService.ScriptsRoot). -->
+    <None Include="..\TenantDatabase\**\*.sql" LinkBase="TenantDatabase" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

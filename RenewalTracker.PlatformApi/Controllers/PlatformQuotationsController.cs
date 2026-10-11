@@ -4,6 +4,7 @@ using RenewalTracker.Platform.Application.DTOs.Sales;
 using RenewalTracker.Platform.Domain.Entities;
 using RenewalTracker.Platform.Infrastructure.Data;
 using RenewalTracker.PlatformApi.Filters;
+using RenewalTracker.PlatformApi.Services;
 
 namespace RenewalTracker.PlatformApi.Controllers;
 
@@ -66,6 +67,75 @@ public class PlatformQuotationsController : ControllerBase
     }
 
     /// <summary>
+    /// The customer-facing quotation PDF - the same document layout as the
+    /// Business Panel's quotation PDF (see Services/QuotationPdfBuilder.cs).
+    /// The Platform Panel shows it in the quotation View panel and uses it
+    /// for Print / Download, so screen, print and file always match.
+    /// </summary>
+    [HttpGet("{id:int}/pdf")]
+    public async Task<IActionResult> GetQuotationPdf(int id)
+    {
+        var q = await _db.Quotations.AsNoTracking().FirstOrDefaultAsync(x => x.QuotationId == id);
+        if (q == null) return NotFound();
+
+        var bytes = await BuildPdfAsync(_db, q);
+        var fileName = (q.QuoteNo ?? $"quotation-{q.QuotationId}") + ".pdf";
+        Response.Headers["Content-Disposition"] = $"inline; filename=\"{fileName}\"";
+        return File(bytes, "application/pdf");
+    }
+
+    /// <summary>The quotation PDF bytes - shared with the Send dialog (PlatformQuotationSendController), which attaches it to the email.</summary>
+    internal static async Task<byte[]> BuildPdfAsync(PlatformDbContext db, Quotation q)
+    {
+        var id = q.QuotationId;
+        var enquiry = await db.Enquiries.AsNoTracking().FirstOrDefaultAsync(e => e.SalesEnquiryId == q.SalesEnquiryId);
+        var products = await db.QuotationProducts.AsNoTracking().Where(p => p.QuotationId == id).OrderBy(p => p.QuotationProductId).ToListAsync();
+        var productIds = products.Select(p => p.QuotationProductId).ToList();
+        var lines = await db.QuotationServiceLines.AsNoTracking()
+            .Where(s => productIds.Contains(s.QuotationProductId))
+            .OrderBy(s => s.QuotationServiceLineId)
+            .ToListAsync();
+
+        var items = new List<QuotationPdfItem>();
+        foreach (var p in products)
+        {
+            foreach (var s in lines.Where(l => l.QuotationProductId == p.QuotationProductId))
+            {
+                var unitVat = Math.Round(s.Amount * s.VatPercent / 100m, 2);
+                items.Add(new QuotationPdfItem(s.ServiceName, p.ApplicationNameSnapshot, s.Qty, s.Amount, unitVat, s.Amount + unitVat));
+            }
+        }
+
+        var contact = string.Join(" / ", new[] { enquiry?.Mobile, enquiry?.Email }.Where(v => !string.IsNullOrWhiteSpace(v)));
+        var data = new QuotationPdfData(
+            CompanyName: "Bliss Point Group",
+            QuotationNumber: q.QuoteNo ?? $"Q-{q.QuotationId}",
+            CustomerName: enquiry?.CustomerNameSnapshot ?? "-",
+            EnquiryNumber: enquiry?.EnquiryNo ?? $"#{q.SalesEnquiryId}",
+            ContactLine: contact,
+            ContactPerson: enquiry?.ContactPerson ?? string.Empty,
+            CreatedDate: q.QuoteDate,
+            ValidTill: q.ValidTill,
+            Items: items,
+            Net: q.Subtotal,
+            Vat: q.VatAmount,
+            GrandTotal: q.GrandTotal,
+            Notes: q.Notes);
+
+        return QuotationPdfBuilder.Build(data);
+    }
+
+    /// <summary>One quotation as its DTO (customer name, products, service lines) - shared with PlatformQuotationSendController.</summary>
+    internal static async Task<QuotationDto> LoadDtoAsync(PlatformDbContext db, Quotation q)
+    {
+        var customer = (await db.Enquiries.AsNoTracking().FirstOrDefaultAsync(e => e.SalesEnquiryId == q.SalesEnquiryId))?.CustomerNameSnapshot;
+        var products = await db.QuotationProducts.AsNoTracking().Where(p => p.QuotationId == q.QuotationId).ToListAsync();
+        var productIds = products.Select(p => p.QuotationProductId).ToList();
+        var services = await db.QuotationServiceLines.AsNoTracking().Where(s => productIds.Contains(s.QuotationProductId)).ToListAsync();
+        return ToDto(q, customer, products, services);
+    }
+
+    /// <summary>
     /// Generates one or more Quotations for an Enquiry from a picked set of
     /// Products (Applications) and, for each, a manually-entered list of
     /// service lines - typed here directly, not looked up from the Service
@@ -109,6 +179,8 @@ public class PlatformQuotationsController : ControllerBase
             return BadRequest(new { message = $"Already quoted for this enquiry, pick a different product: {duplicateNames}." });
         }
 
+        var masterServices = await LoadMasterServicesAsync(dto.Products.SelectMany(x => x.Services));
+
         // Combined = one Quotation with every picked Product as its own
         // QuotationProduct; Independent = one Quotation per Product, each
         // generated on its own.
@@ -149,6 +221,7 @@ public class PlatformQuotationsController : ControllerBase
                     _db.QuotationServiceLines.Add(new QuotationServiceLine
                     {
                         QuotationProductId = product.QuotationProductId,
+                        ProductServiceId = ValidProductServiceId(s.ProductServiceId, p.ApplicationId, masterServices),
                         ServiceName = s.ServiceName,
                         Qty = qty,
                         Amount = s.Amount,
@@ -188,6 +261,8 @@ public class PlatformQuotationsController : ControllerBase
         }
         var q = await _db.Quotations.FirstOrDefaultAsync(x => x.QuotationId == id);
         if (q == null) return NotFound();
+        if (dto.Status != "Accepted" && await IsInvoicedAsync(id))
+            return BadRequest(new { message = "This quotation has an invoice - it stays Accepted. Delete the invoice first to change it." });
 
         q.Status = dto.Status;
         q.ModifiedDate = DateTime.UtcNow;
@@ -214,6 +289,8 @@ public class PlatformQuotationsController : ControllerBase
     {
         var q = await _db.Quotations.FirstOrDefaultAsync(x => x.QuotationId == id);
         if (q == null) return NotFound();
+        if (await IsInvoicedAsync(id))
+            return BadRequest(new { message = "This quotation has an invoice - its pricing can no longer be edited." });
 
         var products = await _db.QuotationProducts.AsNoTracking().Where(p => p.QuotationId == id).ToListAsync();
         var productIds = products.Select(p => p.QuotationProductId).ToList();
@@ -228,6 +305,8 @@ public class PlatformQuotationsController : ControllerBase
         }
 
         var existingServices = await _db.QuotationServiceLines.Where(s => productIds.Contains(s.QuotationProductId)).ToListAsync();
+        var masterServices = await LoadMasterServicesAsync(dto.Products.SelectMany(x => x.Services));
+        var productAppIds = products.ToDictionary(p => p.QuotationProductId, p => p.ApplicationId);
         _db.QuotationServiceLines.RemoveRange(existingServices);
         await _db.SaveChangesAsync();
 
@@ -240,6 +319,7 @@ public class PlatformQuotationsController : ControllerBase
                 _db.QuotationServiceLines.Add(new QuotationServiceLine
                 {
                     QuotationProductId = p.Id,
+                    ProductServiceId = ValidProductServiceId(s.ProductServiceId, productAppIds.GetValueOrDefault(p.Id), masterServices),
                     ServiceName = s.ServiceName,
                     Qty = qty,
                     Amount = s.Amount,
@@ -271,11 +351,16 @@ public class PlatformQuotationsController : ControllerBase
     {
         var q = await _db.Quotations.FirstOrDefaultAsync(x => x.QuotationId == id);
         if (q == null) return NotFound();
+        if (await IsInvoicedAsync(id))
+            return BadRequest(new { message = "This quotation has an invoice - delete the invoice first." });
 
         _db.Quotations.Remove(q);
         await _db.SaveChangesAsync();
         return NoContent();
     }
+
+    /// <summary>True once an invoice exists for the quotation - pricing, status and delete are then locked.</summary>
+    private Task<bool> IsInvoicedAsync(int quotationId) => _db.Invoices.AsNoTracking().AnyAsync(i => i.QuotationId == quotationId);
 
     /// <summary>QT-000001, QT-000002, ... - a simple incrementing number; nothing in this schema implied a per-year reset.</summary>
     private async Task<string> NextQuoteNoAsync()
@@ -283,6 +368,22 @@ public class PlatformQuotationsController : ControllerBase
         var maxId = await _db.Quotations.MaxAsync(q => (int?)q.QuotationId) ?? 0;
         return $"QT-{maxId + 1:D6}";
     }
+
+    /// <summary>Master Product Services referenced by the submitted lines, keyed by id -> ApplicationId, so each line's ProductServiceId can be checked against its own Product.</summary>
+    private async Task<Dictionary<int, int>> LoadMasterServicesAsync(IEnumerable<GenerateQuotationServiceDto> lines)
+    {
+        var ids = lines.Where(l => l.ProductServiceId.HasValue).Select(l => l.ProductServiceId!.Value).Distinct().ToList();
+        if (ids.Count == 0) return new Dictionary<int, int>();
+        return await _db.ProductServices.AsNoTracking()
+            .Where(s => ids.Contains(s.ProductServiceId))
+            .ToDictionaryAsync(s => s.ProductServiceId, s => s.ApplicationId);
+    }
+
+    /// <summary>Keeps a line's ProductServiceId only when that master service exists and belongs to the line's own Product; otherwise the line is stored as free text.</summary>
+    private static int? ValidProductServiceId(int? productServiceId, int applicationId, Dictionary<int, int> masterServices) =>
+        productServiceId.HasValue && masterServices.TryGetValue(productServiceId.Value, out var appId) && appId == applicationId
+            ? productServiceId
+            : null;
 
     private static QuotationDto ToDto(Quotation q, string? customer, List<QuotationProduct> allProducts, List<QuotationServiceLine> allServices) => new()
     {
@@ -310,6 +411,7 @@ public class PlatformQuotationsController : ControllerBase
                     .Select(s => new QuotationServiceLineDto
                     {
                         Id = s.QuotationServiceLineId,
+                        ProductServiceId = s.ProductServiceId,
                         ServiceName = s.ServiceName,
                         Qty = s.Qty,
                         Amount = s.Amount,

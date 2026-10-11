@@ -29,6 +29,13 @@ public static class PlatformInfrastructureRegistration
 
         PlatformServiceRegistrations.Register(services);
 
+        // Database per tenant - created and migrated automatically from the
+        // TenantDatabase/Schema and TenantDatabase/MasterData scripts, at
+        // provisioning and in the background (see TenantDatabaseService).
+        services.AddSingleton<TenantDatabaseQueue>();
+        services.AddScoped<ITenantDatabaseService, TenantDatabaseService>();
+        services.AddHostedService<TenantDatabaseMigrationWorker>();
+
         // See IPlatformTenantProvisioningService - calls across to
         // RenewalTracker.Api's RequireInternalServiceKey-gated
         // api/internal/tenant-provisioning endpoint to finish standing up

@@ -37,13 +37,18 @@ public partial class PlatformDbContext
     public DbSet<Quotation> Quotations { get; set; } = null!;
     public DbSet<QuotationProduct> QuotationProducts { get; set; } = null!;
     public DbSet<QuotationServiceLine> QuotationServiceLines { get; set; } = null!;
+    public DbSet<ProductService> ProductServices { get; set; } = null!;
     public DbSet<SalesPicklistValue> SalesPicklists { get; set; } = null!;
     public DbSet<Payment> Payments { get; set; } = null!;
+    public DbSet<Invoice> Invoices { get; set; } = null!;
     public DbSet<AppDefinition> Applications { get; set; } = null!;
     public DbSet<AppConfig> AppConfigs { get; set; } = null!;
     public DbSet<License> Licenses { get; set; } = null!;
     public DbSet<TenantModule> TenantModules { get; set; } = null!;
     public DbSet<TenantModuleCatalog> TenantModuleCatalogs { get; set; } = null!;
+    public DbSet<TenantMenuItem> TenantMenuItems { get; set; } = null!;
+    public DbSet<TenantMenuAssignment> TenantMenuAssignments { get; set; } = null!;
+    public DbSet<TenantDatabase> TenantDatabases { get; set; } = null!;
     public DbSet<PlatformRole> PlatformRoles { get; set; } = null!;
     public DbSet<PlatformRoleModule> PlatformRoleModules { get; set; } = null!;
 
@@ -203,6 +208,26 @@ public partial class PlatformDbContext
             b.Property(x => x.VatPercent).HasDefaultValueSql("(0)");
             b.Property(x => x.CreatedDate).HasDefaultValueSql("sysutcdatetime()");
             b.HasOne(x => x.QuotationProduct).WithMany().HasForeignKey(x => x.QuotationProductId).OnDelete(DeleteBehavior.Cascade);
+            // Optional back-reference to the master service the line was
+            // copied from. SET NULL on delete: the line keeps its own copied
+            // name/price and simply becomes a free-text line.
+            b.HasOne(x => x.ProductService).WithMany().HasForeignKey(x => x.ProductServiceId).OnDelete(DeleteBehavior.SetNull);
+        });
+
+        // Product Services - master services per Product (dbo.Applications),
+        // Product -> Service only. See ProductService.cs and
+        // DatabaseScripts/ProductServices_Schema.sql. Restrict to
+        // Applications like every other master-data reference here.
+        modelBuilder.Entity<ProductService>(b =>
+        {
+            b.ToTable("ProductServices");
+            b.HasIndex(x => new { x.ApplicationId, x.ServiceName }).IsUnique();
+            b.Property(x => x.DefaultQty).HasDefaultValueSql("(1)");
+            b.Property(x => x.VatPercent).HasDefaultValueSql("(0)");
+            b.Property(x => x.IsActive).HasDefaultValueSql("1");
+            b.Property(x => x.DisplayOrder).HasDefaultValueSql("0");
+            b.Property(x => x.CreatedDate).HasDefaultValueSql("sysutcdatetime()");
+            b.HasOne(x => x.Application).WithMany().HasForeignKey(x => x.ApplicationId).OnDelete(DeleteBehavior.Restrict);
         });
 
         // Sales picklists (Enquiry Status, Enquiry Priority, ...) - replaces
@@ -252,6 +277,19 @@ public partial class PlatformDbContext
             b.HasOne(x => x.Tenant).WithMany().HasForeignKey(x => x.TenantId).OnDelete(DeleteBehavior.Restrict);
             b.HasOne(x => x.Quotation).WithMany().HasForeignKey(x => x.QuotationId).OnDelete(DeleteBehavior.Restrict);
             b.HasOne(x => x.License).WithMany().HasForeignKey(x => x.LicenseId).OnDelete(DeleteBehavior.Restrict);
+        });
+
+        // dbo.SalesInvoices - one per Accepted Quotation. See Invoice.cs and
+        // DatabaseScripts/Invoices_Schema.sql.
+        modelBuilder.Entity<Invoice>(b =>
+        {
+            b.ToTable("SalesInvoices");
+            b.HasIndex(x => x.QuotationId).IsUnique();
+            b.HasIndex(x => x.InvoiceNumber).IsUnique();
+            b.Property(x => x.Status).HasDefaultValueSql("'Created'");
+            b.Property(x => x.SentCount).HasDefaultValueSql("0");
+            b.Property(x => x.CreatedDate).HasDefaultValueSql("sysutcdatetime()");
+            b.HasOne(x => x.Quotation).WithMany().HasForeignKey(x => x.QuotationId).OnDelete(DeleteBehavior.Restrict);
         });
 
         modelBuilder.Entity<AppDefinition>(b =>
@@ -312,6 +350,38 @@ public partial class PlatformDbContext
             b.Property(x => x.IsCore).HasDefaultValueSql("0");
             b.Property(x => x.CreatedDate).HasDefaultValueSql("SYSUTCDATETIME()");
             b.HasOne(x => x.ParentTenantModuleCatalog).WithMany().HasForeignKey(x => x.ParentTenantModuleCatalogId).OnDelete(DeleteBehavior.Restrict);
+        });
+
+        modelBuilder.Entity<TenantMenuItem>(b =>
+        {
+            b.ToTable("TenantMenuItems");
+            b.HasIndex(x => x.MenuKey).IsUnique();
+            b.Property(x => x.IsActive).HasDefaultValueSql("1");
+            b.Property(x => x.IsSystemMenu).HasDefaultValueSql("0");
+            b.Property(x => x.DisplayOrder).HasDefaultValueSql("0");
+            b.Property(x => x.ApplicationCode).HasDefaultValueSql("'TRACKER'");
+            b.Property(x => x.CreatedDate).HasDefaultValueSql("SYSUTCDATETIME()");
+            b.HasOne<TenantMenuItem>().WithMany().HasForeignKey(x => x.ParentMenuItemId).OnDelete(DeleteBehavior.Restrict);
+        });
+
+        // dbo.TenantMenuAssignments - which Business Panel menus each tenant was given (Provision tenant).
+        modelBuilder.Entity<TenantMenuAssignment>(b =>
+        {
+            b.ToTable("TenantMenuAssignments");
+            b.HasIndex(x => new { x.TenantId, x.MenuItemId }).IsUnique();
+            b.Property(x => x.CreatedDate).HasDefaultValueSql("SYSUTCDATETIME()");
+            b.HasOne<Tenant>().WithMany().HasForeignKey(x => x.TenantId).OnDelete(DeleteBehavior.Cascade);
+            b.HasOne<TenantMenuItem>().WithMany().HasForeignKey(x => x.MenuItemId).OnDelete(DeleteBehavior.Cascade);
+        });
+
+        // dbo.TenantDatabases - database-per-tenant registry, created and kept up to date by TenantDatabaseService.
+        modelBuilder.Entity<TenantDatabase>(b =>
+        {
+            b.ToTable("TenantDatabases");
+            b.HasIndex(x => x.TenantId).IsUnique();
+            b.HasIndex(x => x.DatabaseName).IsUnique();
+            b.Property(x => x.CreatedDate).HasDefaultValueSql("SYSUTCDATETIME()");
+            b.HasOne<Tenant>().WithMany().HasForeignKey(x => x.TenantId).OnDelete(DeleteBehavior.Cascade);
         });
     }
 }

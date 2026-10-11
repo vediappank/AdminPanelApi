@@ -59,6 +59,10 @@ public class PlatformBillingController : ControllerBase
         var quotation = await _db.Quotations.AsNoTracking().FirstOrDefaultAsync(q => q.QuotationId == quotationId);
         if (quotation == null) return NotFound(new { message = "Quotation not found." });
 
+        // Sale-side payments are taken against the quotation's invoice (Sales Pipeline ▸ Create invoice).
+        if (!await _db.Invoices.AsNoTracking().AnyAsync(i => i.QuotationId == quotationId))
+            return BadRequest(new { message = "Create the invoice for this quotation before recording a payment." });
+
         if (dto.Amount <= 0) return BadRequest(new { message = "Payment amount must be positive." });
 
         var paidSoFar = await _db.Payments.AsNoTracking().Where(p => p.QuotationId == quotationId).SumAsync(p => (decimal?)p.Amount) ?? 0m;

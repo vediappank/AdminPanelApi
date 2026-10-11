@@ -35,10 +35,11 @@ public class QuotationProductDto
     public List<QuotationServiceLineDto> Services { get; set; } = new();
 }
 
-/// <summary>One manually-typed service line under a Product - see QuotationServiceLine.cs. Never sourced from the Service Catalog.</summary>
+/// <summary>One service line under a Product - see QuotationServiceLine.cs. ProductServiceId is set when the line was taken from the Product's master services (dbo.ProductServices), null for a free-text line.</summary>
 public class QuotationServiceLineDto
 {
     public int Id { get; set; }
+    public int? ProductServiceId { get; set; }
     public string ServiceName { get; set; } = string.Empty;
     public int Qty { get; set; } = 1;
     public decimal Amount { get; set; }
@@ -67,6 +68,8 @@ public class GenerateQuotationProductDto
 
 public class GenerateQuotationServiceDto
 {
+    /// <summary>Master Product Service this line came from (optional - null for free text). Ignored if it doesn't belong to the line's Product.</summary>
+    public int? ProductServiceId { get; set; }
     public string ServiceName { get; set; } = string.Empty;
     public int Qty { get; set; } = 1;
     public decimal Amount { get; set; }

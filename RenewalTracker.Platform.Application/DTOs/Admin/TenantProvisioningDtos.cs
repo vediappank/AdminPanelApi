@@ -36,6 +36,15 @@ public class ProvisionTenantDto
     public List<int>? ModuleIds { get; set; }
 
     /// <summary>
+    /// Business Panel menus (dbo.TenantMenuItems.MenuItemId) ticked on Provision
+    /// tenant ▸ Modules and menus. Saved to dbo.TenantMenuAssignments for the new
+    /// tenant (system menus are always added). When ModuleIds is not sent, the
+    /// modules are derived from these menus' ModuleId. Null = old behaviour
+    /// (no menu assignments written).
+    /// </summary>
+    public List<int>? MenuItemIds { get; set; }
+
+    /// <summary>
     /// Set only when this provisioning was launched from the Sales ▸ Leads
     /// screen's own "Convert to Tenant" action - the SalesLeads.LeadId being
     /// converted. Null for an ordinary Tenants ▸ + Provision tenant. Stamped
@@ -91,4 +100,7 @@ public class ProvisionTenantBusinessSideDto
     /// it there in place of "enable every active module" for this to take
     /// effect end-to-end.</summary>
     public List<int>? ModuleIds { get; set; }
+
+    /// <summary>Mirrors ProvisionTenantDto.MenuItemIds - the Business Panel menus this tenant gets.</summary>
+    public List<int>? MenuItemIds { get; set; }
 }
