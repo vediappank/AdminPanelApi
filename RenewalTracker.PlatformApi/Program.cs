@@ -158,6 +158,15 @@ try
     app.UseAuthorization();
     app.MapControllers();
 
+    // Root (no auth): opening https://adminpanelapi.givingsign.in/ in a browser goes to Swagger
+    // when it is enabled, otherwise shows a short status instead of a bare 401.
+    var swaggerOn = app.Environment.IsDevelopment() || app.Configuration.GetValue("Swagger:Enabled", false);
+    app.MapGet("/", (IWebHostEnvironment env) => swaggerOn
+            ? Results.Redirect("/swagger")
+            : Results.Ok(new { service = "RenewalTracker.PlatformApi", status = "ok", environment = env.EnvironmentName }))
+        .AllowAnonymous()
+        .ExcludeFromDescription();
+
     // Health check (no auth - bypasses the FallbackPolicy): https://adminpanelapi.givingsign.in/health
     app.MapGet("/health", (IWebHostEnvironment env) =>
             Results.Ok(new { status = "ok", environment = env.EnvironmentName, time = DateTime.Now }))
