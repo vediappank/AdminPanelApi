@@ -1,6 +1,7 @@
 using Microsoft.Extensions.DependencyInjection;
 using RenewalTracker.Platform.Application.Interfaces;
 using RenewalTracker.Platform.Infrastructure.Auth;
+using RenewalTracker.Platform.Infrastructure.Repositories;
 using RenewalTracker.Platform.Infrastructure.Services;
 
 namespace RenewalTracker.Platform.Infrastructure.DependencyInjection;
@@ -20,5 +21,11 @@ public static class PlatformServiceRegistrations
         services.AddScoped<IPlatformJwtTokenService, PlatformJwtTokenService>();
         services.AddScoped<IPlatformAuthService, PlatformAuthService>();
         services.AddScoped<IPlatformUserAdminService, PlatformUserAdminService>();
+
+        // Website Leads - Dapper over the dbo.usp_Web* stored procedures.
+        services.AddScoped<IWebLeadRepository, WebLeadRepository>();
+
+        // Website Settings - social links etc. the website reads at runtime (dbo.usp_WebSetting_*).
+        services.AddScoped<IWebSettingRepository, WebSettingRepository>();
     }
 }

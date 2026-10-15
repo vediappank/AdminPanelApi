@@ -20,3 +20,10 @@ packages/
 # Environment
 .env
 *.local
+
+# Production secrets (DB password, JWT key) - kept on this PC and the server only
+appsettings.Production.json
+
+# Runtime logs
+Logs/
+logs/

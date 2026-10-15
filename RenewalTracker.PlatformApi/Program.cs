@@ -1,11 +1,15 @@
 using System.Text;
+using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using RenewalTracker.Platform.Infrastructure.Auth;
 using RenewalTracker.Platform.Infrastructure.DependencyInjection;
+using RenewalTracker.PlatformApi.Controllers;
+using RenewalTracker.PlatformApi.Hubs;
 using RenewalTracker.PlatformApi.Json;
 using RenewalTracker.PlatformApi.Middleware;
+using RenewalTracker.PlatformApi.Services;
 
 try
 {
@@ -60,6 +64,21 @@ try
             IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtOptions.Key)),
             ValidateLifetime = true,
             ClockSkew = TimeSpan.FromMinutes(1),
+        };
+
+        // SignalR (Website Leads live alerts): browsers can't set an
+        // Authorization header on a WebSocket, so the Angular client sends
+        // the same platform JWT as ?access_token=... - accepted ONLY on the
+        // hub path, never for ordinary API calls.
+        options.Events = new JwtBearerEvents
+        {
+            OnMessageReceived = context =>
+            {
+                var accessToken = context.Request.Query["access_token"];
+                if (!string.IsNullOrEmpty(accessToken) && context.HttpContext.Request.Path.StartsWithSegments(WebLeadsHub.Path))
+                    context.Token = accessToken;
+                return Task.CompletedTask;
+            },
         };
     });
 
@@ -121,6 +140,53 @@ try
         });
     });
 
+    // Website Leads: blisspointgroup.com forms post (anonymously) to
+    // api/public/web-forms/* - see PublicWebFormsController. Only the
+    // website's own origins may call it from a browser.
+    var websiteOrigins = builder.Configuration.GetSection("Website:AllowedOrigins").Get<string[]>()
+        ?? new[] { "https://blisspointgroup.com", "https://www.blisspointgroup.com" };
+
+    builder.Services.AddCors(options =>
+    {
+        options.AddPolicy(PublicWebFormsController.WebsiteCorsPolicy, policy =>
+        {
+            policy.WithOrigins(websiteOrigins)
+                  .AllowAnyHeader()
+                  .WithMethods("GET", "POST", "OPTIONS");   // GET: api/public/web-settings
+        });
+    });
+
+    // Website Leads: at most N submissions per visitor IP per minute
+    // (Website:RateLimitPerMinute, default 10) - stops form-flooding bots.
+    var perMinute = builder.Configuration.GetValue("Website:RateLimitPerMinute", 10);
+    builder.Services.AddRateLimiter(options =>
+    {
+        options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+        options.OnRejected = async (context, ct) =>
+        {
+            context.HttpContext.Response.ContentType = "application/json";
+            await context.HttpContext.Response.WriteAsync(
+                "{\"message\":\"Too many submissions from your network. Please wait a minute and try again.\"}", ct);
+        };
+        options.AddPolicy(PublicWebFormsController.RateLimitPolicy, httpContext =>
+        {
+            var forwarded = httpContext.Request.Headers["X-Forwarded-For"].ToString();
+            var ip = !string.IsNullOrWhiteSpace(forwarded)
+                ? forwarded.Split(',')[0].Trim()
+                : httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+            return RateLimitPartition.GetFixedWindowLimiter(ip, _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = Math.Max(1, perMinute),
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0,
+            });
+        });
+    });
+
+    // Website Leads: real-time alerts to the Admin Panel (/hubs/web-leads).
+    builder.Services.AddSignalR();
+    builder.Services.AddSingleton<WebLeadNotifier>();
+
     var app = builder.Build();
 
     // Temporary startup diagnostic - prints on every boot, regardless of the
@@ -152,11 +218,18 @@ try
     // true final status code, including a request that failed.
     app.UseMiddleware<RequestResponseLoggingMiddleware>();
     app.UseMiddleware<ExceptionHandlingMiddleware>();
-    app.UseHttpsRedirection();
+    // Local runs: no http -> https redirect. A browser will not follow a redirect on a CORS pre-check,
+    // so the local website (http://localhost:5291) would otherwise be blocked. Production is unchanged.
+    if (!app.Environment.IsDevelopment())
+        app.UseHttpsRedirection();
+    // Default policy for the Admin Panel; PublicWebFormsController overrides it
+    // with [EnableCors("Website")] (endpoint metadata wins over this default).
     app.UseCors("PlatformAdminClient");
+    app.UseRateLimiter();
     app.UseAuthentication();
     app.UseAuthorization();
     app.MapControllers();
+    app.MapHub<WebLeadsHub>(WebLeadsHub.Path);
 
     // Root (no auth): opening https://adminpanelapi.givingsign.in/ in a browser goes to Swagger
     // when it is enabled, otherwise shows a short status instead of a bare 401.

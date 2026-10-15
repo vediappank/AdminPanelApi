@@ -28,6 +28,8 @@
     <PackageReference Include="BCrypt.Net-Next" Version="4.0.3" />
     <PackageReference Include="Microsoft.Extensions.Http" Version="8.0.0" />
     <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="7.0.3" />
+    <!-- Website Leads (WebLeadRepository) - calls the dbo.usp_Web* stored procedures. -->
+    <PackageReference Include="Dapper" Version="2.1.35" />
   </ItemGroup>
 
 </Project>

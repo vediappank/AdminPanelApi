@@ -6,8 +6,9 @@ namespace RenewalTracker.PlatformApi.Services;
 
 /// <summary>
 /// Reads the "Smtp" section of appsettings.json (Host, Port, EnableSsl, UserName,
-/// Password, FromEmail, FromName) and sends one email with a PDF attached.
-/// Used by the quotation Send dialog (PlatformQuotationSendController).
+/// Password, FromEmail, FromName) and sends one email - with a PDF attached
+/// for the quotation Send dialog (PlatformQuotationSendController, SendAsync),
+/// or plain HTML for Website Leads department alerts (WebLeadNotifier, SendHtmlAsync).
 /// </summary>
 public static class SmtpMail
 {
@@ -33,8 +34,21 @@ public static class SmtpMail
             FromName: string.IsNullOrWhiteSpace(s["FromName"]) ? CompanyName : s["FromName"]!.Trim());
     }
 
-    public static async Task SendAsync(Settings smtp, string to, IEnumerable<string> cc, string subject, string htmlBody,
-        byte[] pdf, string pdfFileName, CancellationToken cancellationToken)
+    public static Task SendAsync(Settings smtp, string to, IEnumerable<string> cc, string subject, string htmlBody,
+        byte[] pdf, string pdfFileName, CancellationToken cancellationToken) =>
+        SendCoreAsync(smtp, new[] { to }, cc, subject, htmlBody, replyTo: null, pdf, pdfFileName, cancellationToken);
+
+    /// <summary>
+    /// HTML email with no attachment - used by the Website Leads alerts
+    /// (WebLeadNotifier) to copy each website submission to a department inbox.
+    /// <paramref name="replyTo"/> lets staff answer the website visitor straight from their mail client.
+    /// </summary>
+    public static Task SendHtmlAsync(Settings smtp, IEnumerable<string> to, string subject, string htmlBody,
+        string? replyTo, CancellationToken cancellationToken) =>
+        SendCoreAsync(smtp, to, Array.Empty<string>(), subject, htmlBody, replyTo, pdf: null, pdfFileName: null, cancellationToken);
+
+    private static async Task SendCoreAsync(Settings smtp, IEnumerable<string> to, IEnumerable<string> cc, string subject, string htmlBody,
+        string? replyTo, byte[]? pdf, string? pdfFileName, CancellationToken cancellationToken)
     {
         using var message = new MailMessage
         {
@@ -45,20 +59,33 @@ public static class SmtpMail
             SubjectEncoding = Encoding.UTF8,
             BodyEncoding = Encoding.UTF8,
         };
-        message.To.Add(new MailAddress(to));
+        foreach (var address in to) message.To.Add(new MailAddress(address));
         foreach (var address in cc) message.CC.Add(new MailAddress(address));
-        using var pdfStream = new MemoryStream(pdf, writable: false);
-        message.Attachments.Add(new Attachment(pdfStream, pdfFileName, System.Net.Mime.MediaTypeNames.Application.Pdf));
+        if (!string.IsNullOrWhiteSpace(replyTo)) message.ReplyToList.Add(new MailAddress(replyTo));
 
-        using var client = new SmtpClient(smtp.Host, smtp.Port)
+        MemoryStream? pdfStream = null;
+        try
         {
-            Credentials = new NetworkCredential(smtp.UserName, smtp.Password),
-            EnableSsl = smtp.EnableSsl,
-            UseDefaultCredentials = false,
-            DeliveryMethod = SmtpDeliveryMethod.Network,
-            Timeout = 60000,
-        };
-        await client.SendMailAsync(message, cancellationToken);
+            if (pdf != null)
+            {
+                pdfStream = new MemoryStream(pdf, writable: false);
+                message.Attachments.Add(new Attachment(pdfStream, pdfFileName ?? "document.pdf", System.Net.Mime.MediaTypeNames.Application.Pdf));
+            }
+
+            using var client = new SmtpClient(smtp.Host, smtp.Port)
+            {
+                Credentials = new NetworkCredential(smtp.UserName, smtp.Password),
+                EnableSsl = smtp.EnableSsl,
+                UseDefaultCredentials = false,
+                DeliveryMethod = SmtpDeliveryMethod.Network,
+                Timeout = 60000,
+            };
+            await client.SendMailAsync(message, cancellationToken);
+        }
+        finally
+        {
+            pdfStream?.Dispose();
+        }
     }
 
     /// <summary>Plain text (as typed in the dialog) to simple HTML, followed by a small details table.</summary>
