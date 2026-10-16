@@ -1,0 +1,43 @@
+{
+  "ConnectionStrings": {
+    "DefaultConnection": "Server=.\\MSSQLSERVER2016;Database=SuperAdminPanel;User Id=adminpanel;Password=vediappan@392687;TrustServerCertificate=True;MultipleActiveResultSets=True;"
+  },
+  "Jwt": {
+    "Key": "3xP__B8Dkk2kfQRdNtCznv-gfN8TmQcmksApF13DvYkFjWt5XdVTeuRTfWjYFFwx",
+    "Issuer": "RenewalTracker.PlatformApi",
+    "Audience": "RenewalTracker.PlatformClient",
+    "ExpiryMinutes": 480
+  },
+  "Cors": {
+    "AllowedOrigins": [
+      "https://adminpanel.givingsign.in",
+      "http://adminpanel.givingsign.in",
+      "http://localhost:4300",
+      "https://localhost:4300"
+    ]
+  },
+  "Website": {
+    "AllowedOrigins": [
+      "https://blisspointworld.givingsign.in",
+      "http://blisspointworld.givingsign.in",
+      "https://blisspointgroup.com",
+      "https://www.blisspointgroup.com"
+    ],
+    "RateLimitPerMinute": 10,
+    "CvStoragePath": "",
+    "NotifyEmail": "",
+    "CareersNotifyEmail": ""
+  },
+  "BusinessApiInternal": {
+    "BaseUrl": "https://businesspanelapi.givingsign.in/"
+  },
+  "Provisioning": {
+    "SkipBusinessApiCall": true
+  },
+  "TenantDatabase": {
+    "Enabled": false
+  },
+  "Swagger": {
+    "Enabled": true
+  }
+}

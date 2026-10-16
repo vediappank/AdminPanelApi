@@ -1,0 +1,62 @@
+{
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.AspNetCore": "Warning",
+      "Microsoft.EntityFrameworkCore": "Warning"
+    }
+  },
+  "AllowedHosts": "*",
+  "ConnectionStrings": {
+    "DefaultConnection": "Server=DESKTOP-RJ6G6KP;Database=SuperAdminPanel;User Id=sa;Password=123456789;TrustServerCertificate=True;MultipleActiveResultSets=True;"
+  },
+  "Jwt": {
+    "Key": "CHANGE_ME_to_a_random_secret_at_least_32_characters_long",
+    "Issuer": "RenewalTracker.PlatformApi",
+    "Audience": "RenewalTracker.PlatformClient",
+    "ExpiryMinutes": 480
+  },
+  "Cors": {
+    "AllowedOrigins": [
+      "http://localhost:4300"
+    ]
+  },
+  "BusinessApiInternal": {
+    "BaseUrl": "https://localhost:5081/"
+  },
+  "Internal": {
+    "ServiceKey": "CHANGE_ME_to_a_random_shared_secret_at_least_32_characters_long"
+  },
+  "Provisioning": {
+    "SkipBusinessApiCall": false
+  },
+  "Smtp": {
+    "Host": "smtp.gmail.com",
+    "Port": 587,
+    "EnableSsl": true,
+    "UserName": "",
+    "Password": "",
+    "FromEmail": "",
+    "FromName": "Bliss Point Group"
+  },
+  "TenantDatabase": {
+    "Enabled": true,
+    "DatabasePrefix": "BP_",
+    "ScriptsPath": "",
+    "BackupFolder": "",
+    "AutoMigrateMinutes": 10,
+    "TemplateDatabase": "BusinessPanel",
+    "TemplateTables": []
+  },
+  "Website": {
+    "AllowedOrigins": [
+      "https://blisspointgroup.com",
+      "https://www.blisspointgroup.com",
+      "http://localhost:8080"
+    ],
+    "RateLimitPerMinute": 10,
+    "CvStoragePath": "",
+    "NotifyEmail": "",
+    "CareersNotifyEmail": ""
+  }
+}

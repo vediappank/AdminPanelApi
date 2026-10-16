@@ -18,7 +18,14 @@ public class WebLeadExceptionFilterAttribute : ExceptionFilterAttribute
     {
         if (context.Exception is not WebLeadException ex) return;
 
-        context.Result = new ObjectResult(new { message = ex.Message }) { StatusCode = ex.StatusCode };
+        // A business rule refused by a stored procedure (form switched off, not found, invalid status...).
+        // Logged as a warning (Logs/errors.log) with the request id the caller also receives.
+        var id = RenewalTracker.PlatformApi.Middleware.RequestId.Get(context.HttpContext);
+        var logger = context.HttpContext.RequestServices.GetRequiredService<ILoggerFactory>().CreateLogger("WebLeads");
+        logger.LogWarning(ex.InnerException, "[{RequestId}] {Method} {Path} refused ({Status}): {Message}",
+            id, context.HttpContext.Request.Method, context.HttpContext.Request.Path, ex.StatusCode, ex.Message);
+
+        context.Result = new ObjectResult(new { message = ex.Message, requestId = id }) { StatusCode = ex.StatusCode };
         context.ExceptionHandled = true;
     }
 }

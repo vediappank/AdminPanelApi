@@ -185,7 +185,12 @@ try
 
     // Website Leads: real-time alerts to the Admin Panel (/hubs/web-leads).
     builder.Services.AddSignalR();
+    // WhatsApp Business Platform (Cloud API) - new-lead alerts + visitor confirmations ("WhatsApp" section).
+    builder.Services.AddHttpClient(WhatsAppCloud.HttpClientName, c => c.Timeout = TimeSpan.FromSeconds(30));
+    builder.Services.AddSingleton<WhatsAppCloud>();
     builder.Services.AddSingleton<WebLeadNotifier>();
+    // Self-check (database objects, Logs folder, origins) - startup log line + GET api/platform/diagnostics
+    builder.Services.AddSingleton<ApiDiagnostics>();
 
     var app = builder.Build();
 
@@ -206,6 +211,50 @@ try
         app.Configuration["BusinessApiInternal:BaseUrl"],
         Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
             System.Text.Encoding.UTF8.GetBytes(app.Configuration["Internal:ServiceKey"] ?? string.Empty)))[..8]);
+
+    // ---------------------------------------------------------------------
+    // Startup report: where the logs are, and whether everything the API needs is in place.
+    // Problems are logged as warnings, so they appear at the top of Logs/errors.log.
+    // ---------------------------------------------------------------------
+    app.Logger.LogInformation("API starting - environment {Environment}, logs folder {LogsFolder}",
+        app.Environment.EnvironmentName, ApiDiagnostics.LogsFolder);
+    {
+        var smtp = SmtpMail.Read(app.Configuration);
+        var wa = app.Services.GetRequiredService<WhatsAppCloud>().Read();
+        app.Logger.LogInformation(
+            "NOTIFICATIONS -> Email: {Email} (host {Host}:{Port}, from {From}, leads to {NotifyEmail}, visitor acknowledgement {Ack}) | WhatsApp: {WhatsApp} (staff numbers {StaffCount}, staff template '{StaffTemplate}', customer template '{CustomerTemplate}')",
+            smtp.IsConfigured ? "ON" : "OFF - set Smtp:Host/UserName/Password", smtp.Host, smtp.Port, smtp.FromEmail,
+            string.IsNullOrWhiteSpace(app.Configuration["Website:NotifyEmail"]) ? "(per-form NotifyEmail only)" : app.Configuration["Website:NotifyEmail"],
+            bool.TryParse(app.Configuration["Website:SendAcknowledgement"], out var ack) && !ack ? "off" : "on",
+            wa.IsConfigured ? "ON" : (wa.Enabled ? "OFF - set WhatsApp:PhoneNumberId/AccessToken" : "OFF"),
+            wa.StaffNumbers.Count, wa.StaffTemplate.Name, wa.CustomerTemplate.Name);
+    }
+    AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+        app.Logger.LogCritical(e.ExceptionObject as Exception, "Unhandled exception - the API process is stopping");
+    TaskScheduler.UnobservedTaskException += (_, e) =>
+    {
+        app.Logger.LogError(e.Exception, "Unobserved background task exception");
+        e.SetObserved();
+    };
+    _ = Task.Run(async () =>
+    {
+        try
+        {
+            var report = await app.Services.GetRequiredService<ApiDiagnostics>().RunAsync();
+            if (report.Healthy)
+                app.Logger.LogInformation(
+                    "STARTUP CHECK OK -> database {Server}/{Database} reachable, Website Leads objects present ({Forms} active forms), website origins: {Origins}",
+                    report.DatabaseServer, report.DatabaseName, report.ActiveWebsiteForms, string.Join(", ", report.WebsiteAllowedOrigins));
+            else
+                foreach (var problem in report.Problems)
+                    app.Logger.LogWarning("STARTUP CHECK PROBLEM -> {Problem}", problem);
+        }
+        catch (Exception ex)
+        {
+            app.Logger.LogError(ex, "Startup check could not run");
+        }
+    });
+    app.Lifetime.ApplicationStopping.Register(() => app.Logger.LogInformation("API stopping"));
 
     // Swagger: always in Development; in Production only when "Swagger:Enabled": true
     if (app.Environment.IsDevelopment() || app.Configuration.GetValue("Swagger:Enabled", false))
@@ -241,8 +290,13 @@ try
         .ExcludeFromDescription();
 
     // Health check (no auth - bypasses the FallbackPolicy): https://adminpanelapi.givingsign.in/health
-    app.MapGet("/health", (IWebHostEnvironment env) =>
-            Results.Ok(new { status = "ok", environment = env.EnvironmentName, time = DateTime.Now }))
+    // https://adminpanelapi.givingsign.in/health?check=true also reports, without secrets, whether the
+    // logs can be written and whether the database answers - for when the logs themselves are missing.
+    app.MapGet("/health", async (IWebHostEnvironment env, bool? check) =>
+            check == true
+                ? Results.Ok(new { status = "ok", environment = env.EnvironmentName, time = DateTime.Now,
+                                   checks = await app.Services.GetRequiredService<ApiDiagnostics>().QuickCheckAsync() })
+                : Results.Ok(new { status = "ok", environment = env.EnvironmentName, time = DateTime.Now }))
         .AllowAnonymous();
 
     app.Run();
@@ -255,6 +309,11 @@ catch (Exception ex) when (ex is not HostAbortedException)
         File.WriteAllText(
             Path.Combine(AppContext.BaseDirectory, "startup-error.txt"),
             $"{DateTime.Now:O}{Environment.NewLine}{ex}");
+        // ...and into Logs/errors.log, where every other problem is
+        var logs = Path.Combine(AppContext.BaseDirectory, "Logs");
+        Directory.CreateDirectory(logs);
+        File.AppendAllText(Path.Combine(logs, "errors.log"),
+            $"{DateTime.Now:yyyy-MM-dd HH:mm:ss,fff} FATAL Startup - the API could not start: {ex}{Environment.NewLine}");
     }
     catch
     {

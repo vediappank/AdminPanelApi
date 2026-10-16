@@ -8,7 +8,8 @@ namespace RenewalTracker.PlatformApi.Services;
 /// Reads the "Smtp" section of appsettings.json (Host, Port, EnableSsl, UserName,
 /// Password, FromEmail, FromName) and sends one email - with a PDF attached
 /// for the quotation Send dialog (PlatformQuotationSendController, SendAsync),
-/// or plain HTML for Website Leads department alerts (WebLeadNotifier, SendHtmlAsync).
+/// or plain HTML for Website Leads department alerts and visitor acknowledgements (WebLeadNotifier, SendHtmlAsync).
+/// Port 465 is mapped to 587 (STARTTLS) - see Read.
 /// </summary>
 public static class SmtpMail
 {
@@ -24,9 +25,13 @@ public static class SmtpMail
         var s = config.GetSection("Smtp");
         var userName = (s["UserName"] ?? string.Empty).Trim();
         var fromEmail = (s["FromEmail"] ?? string.Empty).Trim();
+        var port = int.TryParse(s["Port"], out var p) ? p : 587;
+        // System.Net.Mail.SmtpClient only speaks STARTTLS, not implicit TLS - port 465 would just time out.
+        // GoDaddy (smtpout.secureserver.net), Gmail and Office 365 all accept STARTTLS on 587.
+        if (port == 465) port = 587;
         return new Settings(
             Host: (s["Host"] ?? string.Empty).Trim(),
-            Port: int.TryParse(s["Port"], out var port) ? port : 587,
+            Port: port,
             EnableSsl: !bool.TryParse(s["EnableSsl"], out var ssl) || ssl,
             UserName: userName,
             Password: (s["Password"] ?? string.Empty).Trim(),
