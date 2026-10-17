@@ -40,6 +40,11 @@ namespace RenewalTracker.Platform.Infrastructure.Services;
 ///   TenantDatabase:AutoMigrateMinutes   10 (0 = only at start-up)
 ///   TenantDatabase:TemplateDatabase     "BusinessPanel" (empty = no copy)
 ///   TenantDatabase:TemplateTables       list of tables to copy, parents first (default: DefaultTemplateTables)
+///   TenantDatabase:BusinessApiLogin     SQL login of the Business Panel API (e.g. "businesspanel"): given read/write/execute
+///                                       in every tenant database (empty = skip, e.g. Windows login on your PC)
+///
+/// Business Panel login: the owner's e-mail is also written to SuperAdminPanel.dbo.TenantUsers (the login
+/// directory - see DatabaseScripts/TenantLogin_SuperAdminPanel.sql), so the owner can sign in to the Business Panel.
 /// </summary>
 public class TenantDatabaseService : ITenantDatabaseService
 {
@@ -516,7 +521,11 @@ WHERE t.schema_id = 1 GROUP BY t.name;";
             }
             // 8. Verify - done by the operator on the Control Center (VerifyAsync).
 
-            var warnings = schema.Warnings.Concat(copy.Warnings).Concat(menus.Warnings).ToList();
+            // Business Panel access - every run, so tenants made before this catch up by themselves:
+            // owner e-mail in the login directory, Business Panel API login allowed into the database.
+            var access = await EnsureBusinessPanelAccessAsync(reg, ct);
+
+            var warnings = schema.Warnings.Concat(copy.Warnings).Concat(menus.Warnings).Concat(access).ToList();
             reg.Status = "Ready";
             reg.LastError = warnings.Count > 0 ? string.Join(" ", warnings) : null;
             reg.LastMigratedDate = DateTime.UtcNow;
@@ -813,6 +822,73 @@ SELECT @userId;";
         cmd.Parameters.AddWithValue("@email", reg.OwnerEmail!);
         cmd.Parameters.AddWithValue("@hash", reg.OwnerPasswordHash!);
         return Convert.ToInt32(await cmd.ExecuteScalarAsync(ct));
+    }
+
+    // ------------------------------------------------------------------ Business Panel access
+
+    /// <summary>
+    /// 1. Owner e-mail -> dbo.TenantUsers (when that table exists): the Business Panel finds the owner's company at login.
+    ///    An e-mail already registered to another company is reported as a warning, never moved.
+    /// 2. TenantDatabase:BusinessApiLogin -> user in the tenant database with db_datareader, db_datawriter and EXECUTE.
+    /// Returns warnings for the Control Center; never throws.
+    /// </summary>
+    private async Task<List<string>> EnsureBusinessPanelAccessAsync(TenantDatabase reg, CancellationToken ct)
+    {
+        var warnings = new List<string>();
+
+        if (reg.OwnerUserId != null && !string.IsNullOrWhiteSpace(reg.OwnerEmail))
+        {
+            try
+            {
+                await using var conn = new SqlConnection(BaseConnectionString);
+                await conn.OpenAsync(ct);
+                await using var cmd = new SqlCommand(@"
+SET NOCOUNT ON;
+IF OBJECT_ID(N'dbo.TenantUsers', N'U') IS NULL BEGIN SELECT CAST(NULL AS INT); RETURN; END;
+DECLARE @e NVARCHAR(200) = LOWER(LTRIM(RTRIM(@email)));
+DECLARE @owner INT = (SELECT TenantId FROM dbo.TenantUsers WHERE Email = @e);
+IF @owner IS NULL INSERT dbo.TenantUsers (Email, TenantId) VALUES (@e, @tenantId);
+SELECT ISNULL(@owner, @tenantId);", conn);
+                cmd.Parameters.AddWithValue("@email", reg.OwnerEmail);
+                cmd.Parameters.AddWithValue("@tenantId", reg.TenantId);
+                var owner = await cmd.ExecuteScalarAsync(ct);
+                if (owner is int ownerTenant && ownerTenant != reg.TenantId)
+                    warnings.Add($"Owner e-mail {reg.OwnerEmail} is already registered to tenant {ownerTenant} - the owner cannot sign in to the Business Panel with it.");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Tenant {TenantId}: owner e-mail not written to dbo.TenantUsers", reg.TenantId);
+                warnings.Add($"Login directory not updated: {ex.Message}");
+            }
+        }
+
+        var apiLogin = (_config["TenantDatabase:BusinessApiLogin"] ?? string.Empty).Trim();
+        if (apiLogin.Length > 0)
+        {
+            try
+            {
+                await using var conn = new SqlConnection(ConnectionFor(reg.DatabaseName));
+                await conn.OpenAsync(ct);
+                await using var cmd = new SqlCommand(@"
+SET NOCOUNT ON;
+IF SUSER_ID(@l) IS NULL BEGIN SELECT 0; RETURN; END;
+DECLARE @q NVARCHAR(300) = QUOTENAME(@l), @s NVARCHAR(600);
+IF DATABASE_PRINCIPAL_ID(@l) IS NULL BEGIN SET @s = N'CREATE USER ' + @q + N' FOR LOGIN ' + @q; EXEC (@s); END;
+IF ISNULL(IS_ROLEMEMBER(N'db_datareader', @l), 0) = 0 BEGIN SET @s = N'ALTER ROLE db_datareader ADD MEMBER ' + @q; EXEC (@s); END;
+IF ISNULL(IS_ROLEMEMBER(N'db_datawriter', @l), 0) = 0 BEGIN SET @s = N'ALTER ROLE db_datawriter ADD MEMBER ' + @q; EXEC (@s); END;
+SET @s = N'GRANT EXECUTE TO ' + @q; EXEC (@s);
+SELECT 1;", conn);
+                cmd.Parameters.AddWithValue("@l", apiLogin);
+                if (Convert.ToInt32(await cmd.ExecuteScalarAsync(ct)) == 0)
+                    warnings.Add($"SQL login {apiLogin} (TenantDatabase:BusinessApiLogin) does not exist on this server.");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Tenant {TenantId}: Business Panel API login {Login} not given access to {Db}", reg.TenantId, apiLogin, reg.DatabaseName);
+                warnings.Add($"Business Panel API login {apiLogin} could not be given access: {ex.Message}");
+            }
+        }
+        return warnings;
     }
 
     // ------------------------------------------------------------------ template copy

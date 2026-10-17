@@ -4,6 +4,7 @@
   from the Admin Panel database (SuperAdminPanel)
   ============================================================================
   TENANT data (always cleared):
+    dbo.TenantUsers                Business Panel login directory (e-mail -> tenant)
     dbo.TenantDatabases            registry of each tenant's own database
     dbo.TenantProvisioningSteps    start / finish time of each provisioning step
     dbo.TenantMenuAssignments      Business Panel menus given to the tenant
@@ -76,6 +77,7 @@ END;
 -- Tables in delete order (children first). Payments is handled separately.
 DECLARE @Tables TABLE (Ord INT PRIMARY KEY, Name SYSNAME, Workflow BIT NOT NULL);
 INSERT @Tables (Ord, Name, Workflow) VALUES
+    (-1, N'TenantUsers',                0),   -- login directory (FK to Tenants)
     ( 0, N'TenantProvisioningSteps',    0),
     ( 1, N'TenantDatabases',            0),
     ( 2, N'TenantMenuAssignments',      0),
@@ -226,6 +228,7 @@ GO
   Verify (expect 0 everywhere)
   ---------------------------------------------------------------------------
 SELECT 'Tenants' T, COUNT(*) N FROM dbo.Tenants
+UNION ALL SELECT 'TenantUsers', COUNT(*) FROM dbo.TenantUsers
 UNION ALL SELECT 'TenantDatabases', COUNT(*) FROM dbo.TenantDatabases
 UNION ALL SELECT 'TenantMenuAssignments', COUNT(*) FROM dbo.TenantMenuAssignments
 UNION ALL SELECT 'TenantModules', COUNT(*) FROM dbo.TenantModules
