@@ -22,6 +22,25 @@ public class TenantDatabase
     [MaxLength(128)]
     public string? ServerName { get; set; }
 
+    /// <summary>How the database comes into existence: "Automatic" = the API runs CREATE DATABASE itself
+    /// (its SQL login needs CREATE DATABASE permission); "Manual" = an operator creates it first
+    /// (e.g. Plesk ▸ Databases ▸ Add Database, exact name = DatabaseName, API login as owner) and
+    /// provisioning only checks that it exists and can be used, then fills it.</summary>
+    [MaxLength(10)]
+    public string DatabaseMode { get; set; } = "Automatic";
+
+    /// <summary>Manual mode only: the database's own SQL user (e.g. the user Plesk creates together with the
+    /// database). When set, provisioning and the Business Panel open this database with this user instead of
+    /// their own SQL logins - for servers where those logins cannot be added to the database.
+    /// Null = the API's / Business Panel's own logins are used.</summary>
+    [MaxLength(128)]
+    public string? DbUser { get; set; }
+
+    /// <summary>Password of <see cref="DbUser"/>, encrypted (TenantDbSecret, key TenantDatabase:CredentialKey).
+    /// Never the plain password.</summary>
+    [MaxLength(500)]
+    public string? DbPassword { get; set; }
+
     /// <summary>Last Schema script applied, e.g. "003_Add_Quotation_Items.sql".</summary>
     [MaxLength(260)]
     public string? SchemaVersion { get; set; }

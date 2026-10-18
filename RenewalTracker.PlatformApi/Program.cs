@@ -21,7 +21,21 @@ try
     // writes the durable Logs/platform-api.log and Logs/requests.log files -
     // see log4net.config and RequestResponseLoggingMiddleware).
     // ---------------------------------------------------------------------
-    builder.Logging.AddLog4Net("log4net.config");
+    // Paths are anchored to the exe folder (AppContext.BaseDirectory), not the process's
+    // current directory: under IIS/Plesk the working directory is not guaranteed to be the
+    // site folder, so relative "log4net.config" / "Logs/..." could resolve somewhere else and
+    // nothing would ever be written. log4net.config reads the folder via %property{LogsDir}.
+    // If log4net cannot open a file (e.g. no write permission on Logs), it reports that on
+    // stderr - visible in Logs\stdout_*.log when stdoutLogEnabled="true" in web.config.
+    log4net.GlobalContext.Properties["LogsDir"] = ApiDiagnostics.LogsFolder;
+    Directory.CreateDirectory(ApiDiagnostics.LogsFolder);
+    if (!builder.Environment.IsDevelopment())
+    {
+        // On the server the console only feeds the IIS stdout log (no rotation, grows forever) -
+        // keep the durable record in log4net's daily files instead.
+        builder.Logging.ClearProviders();
+    }
+    builder.Logging.AddLog4Net(Path.Combine(AppContext.BaseDirectory, "log4net.config"));
 
     // ---------------------------------------------------------------------
     // Configuration
@@ -193,6 +207,24 @@ try
     builder.Services.AddSingleton<ApiDiagnostics>();
 
     var app = builder.Build();
+
+    // Columns added after the first release, created before any request so EF never asks for a missing
+    // column: dbo.PlatformUsers.Mobile (optional mobile of a platform user, unique - see
+    // PlatformContactUniquenessService). Same as DatabaseScripts/PlatformUsers_Mobile.sql.
+    using (var scope = app.Services.CreateScope())
+    {
+        try
+        {
+            var platformDb = scope.ServiceProvider.GetRequiredService<RenewalTracker.Platform.Infrastructure.Data.PlatformDbContext>();
+            Microsoft.EntityFrameworkCore.RelationalDatabaseFacadeExtensions.ExecuteSqlRaw(platformDb.Database,
+                "IF OBJECT_ID(N'dbo.PlatformUsers', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.PlatformUsers', N'Mobile') IS NULL " +
+                "ALTER TABLE dbo.PlatformUsers ADD Mobile NVARCHAR(30) NULL;");
+        }
+        catch (Exception ex)
+        {
+            app.Logger.LogError(ex, "Could not add dbo.PlatformUsers.Mobile - run DatabaseScripts/PlatformUsers_Mobile.sql on SuperAdminPanel");
+        }
+    }
 
     // Temporary startup diagnostic - prints on every boot, regardless of the
     // Logging:LogLevel config, so a config-resolution problem (env var/user

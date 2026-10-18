@@ -21,6 +21,8 @@ public static class PlatformServiceRegistrations
         services.AddScoped<IPlatformJwtTokenService, PlatformJwtTokenService>();
         services.AddScoped<IPlatformAuthService, PlatformAuthService>();
         services.AddScoped<IPlatformUserAdminService, PlatformUserAdminService>();
+        // one e-mail / one mobile per tenant contact and platform user
+        services.AddScoped<IPlatformContactUniquenessService, PlatformContactUniquenessService>();
 
         // Website Leads - Dapper over the dbo.usp_Web* stored procedures.
         services.AddScoped<IWebLeadRepository, WebLeadRepository>();

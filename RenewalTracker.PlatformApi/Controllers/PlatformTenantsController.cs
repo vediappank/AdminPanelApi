@@ -38,12 +38,20 @@ public class PlatformTenantsController : ControllerBase
 {
     private readonly PlatformDbContext _db;
     private readonly IPlatformTenantProvisioningService _provisioning;
+    private readonly IPlatformContactUniquenessService _unique;
 
-    public PlatformTenantsController(PlatformDbContext db, IPlatformTenantProvisioningService provisioning)
+    public PlatformTenantsController(PlatformDbContext db, IPlatformTenantProvisioningService provisioning, IPlatformContactUniquenessService unique)
     {
         _db = db;
         _provisioning = provisioning;
+        _unique = unique;
     }
+
+    /// <summary>Live check for the Edit tenant form: contact e-mail / mobile already used by another tenant?
+    /// GET api/platform/tenants/contact-check?field=email|mobile&amp;value=...&amp;tenantId=2</summary>
+    [HttpGet("contact-check")]
+    public async Task<ActionResult<UniqueCheckDto>> CheckContact([FromQuery] string field, [FromQuery] string? value, [FromQuery] int? tenantId, CancellationToken ct)
+        => Ok(await _unique.CheckTenantContactAsync(field, value, tenantId, ct));
 
     [HttpGet]
     public async Task<ActionResult<List<TenantDto>>> GetAll()
@@ -70,6 +78,10 @@ public class PlatformTenantsController : ControllerBase
         var tenant = await _db.Tenants.FirstOrDefaultAsync(t => t.TenantId == id);
         if (tenant == null) return NotFound();
 
+        // contact e-mail / mobile must not belong to another tenant (unchanged values are always allowed)
+        if (await _unique.TenantContactProblemAsync(dto.ContactEmail, dto.ContactMobile, id) is string problem)
+            return BadRequest(new { message = problem });
+
         tenant.TenantName = dto.TenantName;
         tenant.ContactName = dto.ContactName;
         tenant.ContactEmail = dto.ContactEmail;
@@ -79,6 +91,15 @@ public class PlatformTenantsController : ControllerBase
         await _db.SaveChangesAsync();
         return Ok(ToDto(tenant));
     }
+
+    /// <summary>
+    /// Live check for the Provision / Complete provisioning form: can this e-mail be the owner login?
+    /// tenantId = the tenant being completed (its own e-mail is fine); omit for a new tenant.
+    /// Provision and CompleteProvisioning run the same check before creating anything.
+    /// </summary>
+    [HttpGet("owner-email-check")]
+    public async Task<ActionResult<OwnerEmailCheckDto>> CheckOwnerEmail([FromQuery] string? email, [FromQuery] int? tenantId, CancellationToken ct)
+        => Ok(await _provisioning.CheckOwnerEmailAsync(email, tenantId, ct));
 
     [HttpPost("provision")]
     public async Task<ActionResult<ProvisionTenantResultDto>> Provision(ProvisionTenantDto dto)

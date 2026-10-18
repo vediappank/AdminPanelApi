@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Mvc;
+using RenewalTracker.Platform.Application.DTOs.Generic;
 using RenewalTracker.Platform.Application.DTOs.Platform;
 using RenewalTracker.Platform.Application.Interfaces;
 using RenewalTracker.PlatformApi.Filters;
@@ -18,11 +19,18 @@ namespace RenewalTracker.PlatformApi.Controllers;
 public class PlatformUsersController : ControllerBase
 {
     private readonly IPlatformUserAdminService _service;
+    private readonly IPlatformContactUniquenessService _unique;
 
-    public PlatformUsersController(IPlatformUserAdminService service)
+    public PlatformUsersController(IPlatformUserAdminService service, IPlatformContactUniquenessService unique)
     {
         _service = service;
+        _unique = unique;
     }
+
+    /// <summary>Live check while typing: GET api/platform/users/check-unique?field=email|mobile&amp;value=...&amp;excludeId=3</summary>
+    [HttpGet("check-unique")]
+    public async Task<ActionResult<UniqueCheckDto>> CheckUnique([FromQuery] string field, [FromQuery] string? value, [FromQuery] int? excludeId, CancellationToken ct)
+        => Ok(await _unique.CheckPlatformUserAsync(field, value, excludeId, ct));
 
     [HttpGet]
     public async Task<ActionResult<List<PlatformUserDto>>> Search([FromQuery] string? search)

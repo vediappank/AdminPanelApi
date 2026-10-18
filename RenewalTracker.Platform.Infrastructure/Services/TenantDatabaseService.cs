@@ -35,6 +35,8 @@ namespace RenewalTracker.Platform.Infrastructure.Services;
 /// Config (appsettings, all optional):
 ///   TenantDatabase:Enabled              true
 ///   TenantDatabase:DatabasePrefix       "BP_"
+///   TenantDatabase:DefaultMode          "Automatic" (API creates the database) or "Manual" (you create it, e.g. in Plesk,
+///                                       then provisioning fills it) - pre-selected on Provision tenant, chosen per tenant
 ///   TenantDatabase:ScriptsPath          folder holding Schema/ and MasterData/ (default: found automatically)
 ///   TenantDatabase:BackupFolder         folder on the SQL Server for backups (default: SQL Server's backup folder)
 ///   TenantDatabase:AutoMigrateMinutes   10 (0 = only at start-up)
@@ -42,6 +44,14 @@ namespace RenewalTracker.Platform.Infrastructure.Services;
 ///   TenantDatabase:TemplateTables       list of tables to copy, parents first (default: DefaultTemplateTables)
 ///   TenantDatabase:BusinessApiLogin     SQL login of the Business Panel API (e.g. "businesspanel"): given read/write/execute
 ///                                       in every tenant database (empty = skip, e.g. Windows login on your PC)
+///   TenantDatabase:CredentialKey        secret text used to encrypt the password of a tenant database's own SQL user
+///                                       (Manual mode with a Plesk database user). Must equal MultiTenant:CredentialKey
+///                                       of the Business Panel API. Changing it = every saved password must be entered again.
+///
+/// Manual mode with the database's own user (shared Plesk SQL servers): Plesk creates a new SQL user with every
+/// database and our logins cannot be added to it. Enter that user and password on the Manual panel - every step
+/// then opens the tenant database with that user (it needs read, write and create-table rights - Plesk's
+/// "Read and Write"), and reads the template / menu data from the Admin Panel side over a second connection.
 ///
 /// Business Panel login: the owner's e-mail is also written to SuperAdminPanel.dbo.TenantUsers (the login
 /// directory - see DatabaseScripts/TenantLogin_SuperAdminPanel.sql), so the owner can sign in to the Business Panel.
@@ -80,6 +90,31 @@ public class TenantDatabaseService : ITenantDatabaseService
     private bool FeatureEnabled => _config.GetValue("TenantDatabase:Enabled", true);
     private string Prefix => _config["TenantDatabase:DatabasePrefix"] ?? "BP_";
     private string TemplateDatabase => (_config["TenantDatabase:TemplateDatabase"] ?? "BusinessPanel").Trim();
+    private string DefaultMode => TenantDatabaseModes.Normalize(_config["TenantDatabase:DefaultMode"]) ?? TenantDatabaseModes.Automatic;
+
+    /// <summary>The SQL login the API connects with (null = Windows / integrated login).</summary>
+    private string? SqlLogin
+    {
+        get
+        {
+            var b = new SqlConnectionStringBuilder(BaseConnectionString);
+            return b.IntegratedSecurity || string.IsNullOrWhiteSpace(b.UserID) ? null : b.UserID;
+        }
+    }
+
+    private string LoginText => SqlLogin ?? "the API's Windows account";
+
+    private string CredentialKey => (_config["TenantDatabase:CredentialKey"] ?? string.Empty).Trim();
+
+    private static readonly Regex ValidDatabaseName = new(@"^[A-Za-z0-9_\-]{1,100}$", RegexOptions.Compiled);
+    private static readonly Regex ValidDbUser = new(@"^[A-Za-z0-9_\-\.@]{1,128}$", RegexOptions.Compiled);
+
+    /// <summary>True when this tenant database is opened with its own SQL user (Manual mode + user entered).</summary>
+    private static bool HasOwnLogin(TenantDatabase reg) =>
+        reg.DatabaseMode == TenantDatabaseModes.Manual && !string.IsNullOrWhiteSpace(reg.DbUser);
+
+    /// <summary>Who opens the tenant database - for messages.</summary>
+    private string WhoText(TenantDatabase reg) => HasOwnLogin(reg) ? $"database user {reg.DbUser}" : LoginText;
 
     /// <summary>Lookup / setup tables copied from the template, parents before children (foreign keys).
     /// Not copied: tenant data (customers, trackers, quotations, invoices, payments, follow-ups, documents),
@@ -138,6 +173,8 @@ public class TenantDatabaseService : ITenantDatabaseService
     {
         var reg = await _db.TenantDatabases.FirstOrDefaultAsync(r => r.TenantId == tenantId, ct);
         if (reg == null || reg.ProvisioningStep <= StepDatabase) return new(false, "This tenant has no database yet.");
+        if (HasOwnLogin(reg))
+            return new(false, $"{reg.DatabaseName} was created in Plesk with its own user - back it up in Plesk (Databases > {reg.DatabaseName} > Back Up).");
         try
         {
             var folder = (_config["TenantDatabase:BackupFolder"] ?? string.Empty).Trim();
@@ -160,7 +197,7 @@ public class TenantDatabaseService : ITenantDatabaseService
         }
     }
 
-    public async Task QueueProvisioningAsync(int tenantId, TenantOwnerLogin? owner, TenantSettings? settings = null, CancellationToken ct = default)
+    public async Task QueueProvisioningAsync(int tenantId, TenantOwnerLogin? owner, TenantSettings? settings = null, TenantDatabaseOptions? database = null, CancellationToken ct = default)
     {
         if (!FeatureEnabled) return;
         await EnsureRegistryTableAsync(ct);
@@ -174,12 +211,19 @@ public class TenantDatabaseService : ITenantDatabaseService
             {
                 TenantId = tenantId,
                 DatabaseName = await UniqueDatabaseNameAsync(tenant.TenantCode, ct),
+                DatabaseMode = DefaultMode,
                 ServerName = new SqlConnectionStringBuilder(BaseConnectionString).DataSource,
                 IsEnabled = true,
                 CreatedDate = DateTime.UtcNow,
                 ProvisioningStep = 1,
             };
             _db.TenantDatabases.Add(reg);
+        }
+        // Mode / name chosen on Provision tenant - only while the database step is still to do.
+        if (database != null && reg.ProvisioningStep <= StepDatabase)
+        {
+            var error = await ApplyDatabaseOptionsAsync(reg, database, ct);
+            if (error != null) throw new InvalidOperationException(error);
         }
         if (owner != null && !string.IsNullOrWhiteSpace(owner.Email) && !string.IsNullOrEmpty(owner.Password))
         {
@@ -223,11 +267,203 @@ public class TenantDatabaseService : ITenantDatabaseService
         if (registryOnly) return;
         var tenantIds = await _db.Tenants.AsNoTracking().Select(t => t.TenantId).ToListAsync(ct);
         var disabled = (await _db.TenantDatabases.AsNoTracking().Where(r => !r.IsEnabled).Select(r => r.TenantId).ToListAsync(ct)).ToHashSet();
+        // Manual databases that are not there yet wait for the operator (create it, then Run again) -
+        // retrying them every few minutes would only repeat the same "create it first" error.
+        var waitingForManualDatabase = await _db.TenantDatabases.AsNoTracking()
+            .Where(r => r.DatabaseMode == TenantDatabaseModes.Manual && r.Status == "Failed" && r.ProvisioningStep <= StepDatabase)
+            .Select(r => r.TenantId).ToListAsync(ct);
+        disabled.UnionWith(waitingForManualDatabase);
         foreach (var id in tenantIds.Where(id => !disabled.Contains(id)))
         {
             if (ct.IsCancellationRequested) break;
             await EnsureUpToDateAsync(id, ct);
         }
+    }
+
+    public async Task<TenantDatabaseRunResult> SetDatabaseOptionsAsync(int tenantId, TenantDatabaseOptions options, bool runNow, CancellationToken ct = default)
+    {
+        if (!FeatureEnabled) return new(false, "Tenant databases are switched off (TenantDatabase:Enabled = false).");
+        await EnsureRegistryTableAsync(ct);
+        var tenant = await _db.Tenants.AsNoTracking().FirstOrDefaultAsync(t => t.TenantId == tenantId, ct);
+        if (tenant == null) return new(false, "Tenant not found.");
+
+        var reg = await _db.TenantDatabases.FirstOrDefaultAsync(r => r.TenantId == tenantId, ct);
+        if (reg == null)
+        {
+            reg = new TenantDatabase
+            {
+                TenantId = tenantId,
+                DatabaseName = await UniqueDatabaseNameAsync(tenant.TenantCode, ct),
+                DatabaseMode = DefaultMode,
+                ServerName = new SqlConnectionStringBuilder(BaseConnectionString).DataSource,
+                IsEnabled = true,
+                CreatedDate = DateTime.UtcNow,
+                ProvisioningStep = StepDatabase,
+            };
+            _db.TenantDatabases.Add(reg);
+        }
+        else if (reg.ProvisioningStep > StepDatabase)
+        {
+            return new(false, $"Database {reg.DatabaseName} is already created - its mode and name can no longer be changed.");
+        }
+        else if (reg.Status == "Running")
+        {
+            return new(false, "Provisioning is running right now - wait for it to stop, then change the database.");
+        }
+
+        var error = await ApplyDatabaseOptionsAsync(reg, options, ct);
+        if (error != null) return new(false, error);
+
+        if (runNow)
+        {
+            reg.Status = "Pending";
+            reg.LastError = null;
+        }
+        else if (reg.Status == "Pending" && reg.TenantDatabaseId == 0)
+        {
+            reg.Status = "Ready";   // new row, nothing queued - must not look like it is running
+        }
+        reg.ModifiedDate = DateTime.UtcNow;
+        await _db.SaveChangesAsync(ct);
+
+        var what = reg.DatabaseMode == TenantDatabaseModes.Manual
+            ? $"Manual - provisioning will use the existing database {reg.DatabaseName}"
+            : $"Automatic - provisioning will create {reg.DatabaseName}";
+        if (!runNow) return new(true, what + ".");
+
+        await RecordStepAsync(tenantId, StepRegistered, tenant.CreatedDate, tenant.CreatedDate, null, overwrite: false, ct);
+        _queue.Enqueue(tenantId);
+        return new(true, what + " - running now.");
+    }
+
+    public async Task<TenantDatabaseDefaults> GetDatabaseDefaultsAsync(string? tenantCode, CancellationToken ct = default)
+    {
+        string suggested;
+        try
+        {
+            suggested = string.IsNullOrWhiteSpace(tenantCode) ? Prefix : await UniqueDatabaseNameAsync(tenantCode, ct);
+        }
+        catch (SqlException)
+        {
+            // registry table not created yet
+            var clean = Regex.Replace(tenantCode ?? string.Empty, "[^A-Za-z0-9_]", string.Empty).ToUpperInvariant();
+            suggested = Prefix + clean;
+        }
+        return new TenantDatabaseDefaults(DefaultMode, suggested, Prefix, SqlLogin, FeatureEnabled, CredentialKey.Length > 0);
+    }
+
+    public async Task<string?> ValidateDatabaseOptionsAsync(TenantDatabaseOptions? options, int? forTenantId, CancellationToken ct = default)
+    {
+        if (options == null || !FeatureEnabled) return null;
+        if (!string.IsNullOrWhiteSpace(options.Mode) && TenantDatabaseModes.Normalize(options.Mode) == null)
+            return "Database mode must be Automatic or Manual.";
+        if (TenantDatabaseModes.Normalize(options.Mode) == TenantDatabaseModes.Manual && DbUserError(options.DbUser, options.DbPassword, savedUser: null, hasSavedPassword: false) is string userError)
+            return userError;
+        var name = options.DatabaseName?.Trim();
+        if (string.IsNullOrEmpty(name)) return null;
+        if (!ValidDatabaseName.IsMatch(name)) return "Database name: letters, digits, _ and - only, up to 100 characters.";
+        var reserved = new[] { "master", "model", "msdb", "tempdb", AdminDatabase, TemplateDatabase };
+        if (reserved.Any(r => string.Equals(r, name, StringComparison.OrdinalIgnoreCase)))
+            return $"{name} is a system / platform database and cannot be used for a tenant.";
+        try
+        {
+            await EnsureRegistryTableAsync(ct);
+            if (await _db.TenantDatabases.AnyAsync(r => r.DatabaseName == name && (forTenantId == null || r.TenantId != forTenantId), ct))
+                return $"Database name {name} is already used by another tenant.";
+        }
+        catch (SqlException)
+        {
+            // registry not readable - QueueProvisioningAsync checks again
+        }
+        return null;
+    }
+
+    /// <summary>Applies the chosen mode / name to a registry row not past the database step. Returns an error text, or null.</summary>
+    private async Task<string?> ApplyDatabaseOptionsAsync(TenantDatabase reg, TenantDatabaseOptions options, CancellationToken ct)
+    {
+        string mode;
+        if (string.IsNullOrWhiteSpace(options.Mode)) mode = string.IsNullOrWhiteSpace(reg.DatabaseMode) ? DefaultMode : reg.DatabaseMode;
+        else mode = TenantDatabaseModes.Normalize(options.Mode) ?? string.Empty;
+        if (mode.Length == 0) return "Database mode must be Automatic or Manual.";
+
+        var name = options.DatabaseName?.Trim();
+        if (!string.IsNullOrEmpty(name) && !string.Equals(name, reg.DatabaseName, StringComparison.Ordinal))
+        {
+            if (!ValidDatabaseName.IsMatch(name))
+                return "Database name: letters, digits, _ and - only, up to 100 characters.";
+            var reserved = new[] { "master", "model", "msdb", "tempdb", AdminDatabase, TemplateDatabase };
+            if (reserved.Any(r => string.Equals(r, name, StringComparison.OrdinalIgnoreCase)))
+                return $"{name} is a system / platform database and cannot be used for a tenant.";
+            if (await _db.TenantDatabases.AnyAsync(r => r.DatabaseName == name && r.TenantId != reg.TenantId, ct))
+                return $"Database name {name} is already used by another tenant.";
+            reg.DatabaseName = name;
+        }
+        reg.DatabaseMode = mode;
+
+        // The database's own SQL user - Manual only; Automatic always uses the API's login.
+        if (mode == TenantDatabaseModes.Automatic)
+        {
+            reg.DbUser = null;
+            reg.DbPassword = null;
+            return null;
+        }
+        if (options.DbUser == null) return null;   // not sent = keep
+        var user = options.DbUser.Trim();
+        if (user.Length == 0)
+        {
+            reg.DbUser = null;
+            reg.DbPassword = null;
+            return null;
+        }
+        var sameUser = string.Equals(user, reg.DbUser, StringComparison.OrdinalIgnoreCase);
+        if (DbUserError(user, options.DbPassword, reg.DbUser, sameUser && !string.IsNullOrEmpty(reg.DbPassword)) is string error)
+            return error;
+        if (!string.IsNullOrEmpty(options.DbPassword))
+            reg.DbPassword = TenantDbSecret.Protect(options.DbPassword, CredentialKey);
+        reg.DbUser = user;
+        return null;
+    }
+
+    /// <summary>Checks a database user / password pair before it is saved. Null = fine.</summary>
+    private string? DbUserError(string? user, string? password, string? savedUser, bool hasSavedPassword)
+    {
+        user = user?.Trim();
+        if (string.IsNullOrEmpty(user)) return null;
+        if (!ValidDbUser.IsMatch(user)) return "Database user: letters, digits and _ - . @ only, up to 128 characters.";
+        var sameUser = string.Equals(user, savedUser, StringComparison.OrdinalIgnoreCase);
+        if (string.IsNullOrEmpty(password))
+            return sameUser && hasSavedPassword ? null : $"Enter the password of database user {user}.";
+        if (password.Length > 128) return "Database password: up to 128 characters.";
+        if (CredentialKey.Length == 0)
+            return "TenantDatabase:CredentialKey is not set in the Admin Panel API's appsettings - it is needed to save the " +
+                   "database password (encrypted). Add it (same value as MultiTenant:CredentialKey of the Business Panel API), restart the API and try again.";
+        return null;
+    }
+
+    /// <summary>Connection string for the tenant database: its own user (Manual + user entered) or the API's login.</summary>
+    private string TenantConnection(TenantDatabase reg)
+    {
+        var b = new SqlConnectionStringBuilder(BaseConnectionString) { InitialCatalog = reg.DatabaseName };
+        if (!HasOwnLogin(reg)) return b.ConnectionString;
+
+        if (string.IsNullOrEmpty(reg.DbPassword))
+            throw new InvalidOperationException($"No password is saved for database user {reg.DbUser} - enter it on the provisioning screen and run again.");
+        if (CredentialKey.Length == 0)
+            throw new InvalidOperationException("TenantDatabase:CredentialKey is not set in the Admin Panel API's appsettings - the saved database password cannot be read.");
+        string password;
+        try
+        {
+            password = TenantDbSecret.Unprotect(reg.DbPassword, CredentialKey);
+        }
+        catch (Exception ex) when (ex is CryptographicException or FormatException)
+        {
+            throw new InvalidOperationException(
+                $"The saved password of database user {reg.DbUser} cannot be read (TenantDatabase:CredentialKey was changed?) - enter the password again and run again.", ex);
+        }
+        b.IntegratedSecurity = false;
+        b.UserID = reg.DbUser!.Trim();
+        b.Password = password;
+        return b.ConnectionString;
     }
 
     /// <summary>Business API side finished (only when Provisioning:SkipBusinessApiCall is off) - logged only;
@@ -357,9 +593,11 @@ WHEN NOT MATCHED THEN INSERT (TenantId, StepNo, StepName, StartedDate, Completed
 JOIN {0}sys.partitions p ON p.object_id = t.object_id AND p.index_id IN (0, 1)
 WHERE t.schema_id = 1 GROUP BY t.name;";
 
+        string? openError = null;
         if (dbExists)
+        try
         {
-            await using var conn = new SqlConnection(ConnectionFor(dbName!));
+            await using var conn = new SqlConnection(TenantConnection(reg!));
             await conn.OpenAsync(ct);
             await using (var cmd = new SqlCommand(
                 "SELECT name, type FROM sys.objects WHERE schema_id = SCHEMA_ID(N'dbo') AND type IN ('U','V','P','FN','IF','TF','TR')", conn))
@@ -377,6 +615,11 @@ WHERE t.schema_id = 1 GROUP BY t.name;";
                 while (await r.ReadAsync(ct))
                     versions[r.GetString(1) + "|" + r.GetString(0)] = (r.GetString(1), r.GetString(2), r.GetDateTime(3));
             }
+        }
+        catch (Exception ex) when (ex is SqlException or InvalidOperationException)
+        {
+            // e.g. the database user cannot sign in - show what is known instead of failing the screen
+            openError = $"{dbName} cannot be opened with {WhoText(reg!)}: {ex.Message}";
         }
 
         if (templateExists)
@@ -418,7 +661,7 @@ WHERE t.schema_id = 1 GROUP BY t.name;";
         }
 
         return new TenantDatabaseProgress(tenantId, dbName, dbExists, template.Length > 0 ? template : null, templateExists,
-            reg?.ProvisioningStep ?? 0, reg?.Status, reg?.LastError, reg?.LastMigratedDate, DateTime.UtcNow,
+            reg?.ProvisioningStep ?? 0, reg?.Status, openError ?? reg?.LastError, reg?.LastMigratedDate, DateTime.UtcNow,
             objects, masterData, scripts);
     }
 
@@ -446,6 +689,7 @@ WHERE t.schema_id = 1 GROUP BY t.name;";
             {
                 TenantId = tenantId,
                 DatabaseName = await UniqueDatabaseNameAsync(tenant.TenantCode, ct),
+                DatabaseMode = DefaultMode,
                 ServerName = new SqlConnectionStringBuilder(BaseConnectionString).DataSource,
                 Status = "Pending",
                 IsEnabled = true,
@@ -456,6 +700,8 @@ WHERE t.schema_id = 1 GROUP BY t.name;";
         }
 
         var applied = new List<string>();
+        // "Tenant registered" is done once a registry row exists - a failure from here on shows on "Database created".
+        if (reg.ProvisioningStep < StepDatabase) reg.ProvisioningStep = StepDatabase;
         reg.Status = "Running";
         reg.ModifiedDate = DateTime.UtcNow;
         await _db.SaveChangesAsync(ct);
@@ -467,13 +713,27 @@ WHERE t.schema_id = 1 GROUP BY t.name;";
 
             // 1. Database
             var t0 = DateTime.UtcNow;
-            var created = await CreateDatabaseIfMissingAsync(reg.DatabaseName, ct);
-            await EnsureVersionsTableAsync(reg.DatabaseName, ct);
-            await StepDoneAsync(reg, StepDatabase, t0, created ? reg.DatabaseName : null, created, ct);
+            bool created;
+            if (reg.DatabaseMode == TenantDatabaseModes.Manual)
+            {
+                // Manual: created by the operator (e.g. Plesk) - only check it is there and usable.
+                var firstTime = reg.ProvisioningStep <= StepDatabase;
+                await EnsureManualDatabaseUsableAsync(reg, ct);
+                created = firstTime;
+            }
+            else
+            {
+                created = await CreateDatabaseAutomaticAsync(reg.DatabaseName, ct);
+            }
+            await EnsureVersionsTableAsync(reg, ct);
+            await StepDoneAsync(reg, StepDatabase, t0,
+                created ? (reg.DatabaseMode != TenantDatabaseModes.Manual ? reg.DatabaseName
+                    : HasOwnLogin(reg) ? $"{reg.DatabaseName} (created manually, user {reg.DbUser})" : $"{reg.DatabaseName} (created manually)") : null,
+                created, ct);
 
             // 2. Schema - each new script once, in order; a changed one is reported, never re-run.
             t0 = DateTime.UtcNow;
-            var schema = await ApplyScriptsAsync(reg.DatabaseName, "Schema", rerunChanged: false, forceAll: false, ct);
+            var schema = await ApplyScriptsAsync(reg, "Schema", rerunChanged: false, forceAll: false, ct);
             applied.AddRange(schema.Applied);
             if (schema.Last != null) reg.SchemaVersion = schema.Last;
             await StepDoneAsync(reg, StepSchema, t0, schema.Applied.Count > 0 ? string.Join(", ", schema.Applied) : null, schema.Applied.Count > 0, ct);
@@ -481,9 +741,9 @@ WHERE t.schema_id = 1 GROUP BY t.name;";
             // 3. Master data - copied from the template database, then MasterData scripts
             //    (new or changed ones; all of them on Re-seed).
             t0 = DateTime.UtcNow;
-            var copy = await CopyTemplateDataAsync(reg.DatabaseName, forceSeed, ct);
+            var copy = await CopyTemplateDataAsync(reg, forceSeed, ct);
             applied.AddRange(copy.Applied);
-            var seed = await ApplyScriptsAsync(reg.DatabaseName, "MasterData", rerunChanged: true, forceAll: forceSeed, ct);
+            var seed = await ApplyScriptsAsync(reg, "MasterData", rerunChanged: true, forceAll: forceSeed, ct);
             applied.AddRange(seed.Applied);
             if (seed.Last != null) reg.SeedVersion = seed.Last;
             else if (copy.Last != null && reg.SeedVersion == null) reg.SeedVersion = copy.Last;
@@ -559,14 +819,14 @@ WHERE t.schema_id = 1 GROUP BY t.name;";
 
     private sealed record ScriptRun(List<string> Applied, string? Last, List<string> Warnings);
 
-    private async Task<ScriptRun> ApplyScriptsAsync(string database, string kind, bool rerunChanged, bool forceAll, CancellationToken ct)
+    private async Task<ScriptRun> ApplyScriptsAsync(TenantDatabase reg, string kind, bool rerunChanged, bool forceAll, CancellationToken ct)
     {
         var files = ScriptFiles(kind);
         var applied = new List<string>();
         var warnings = new List<string>();
         string? last = null;
 
-        await using var conn = new SqlConnection(ConnectionFor(database));
+        await using var conn = new SqlConnection(TenantConnection(reg));
         await conn.OpenAsync(ct);
         var done = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         await using (var read = new SqlCommand("SELECT ScriptName, Checksum FROM dbo.SchemaVersions WHERE Kind = @kind", conn))
@@ -662,7 +922,7 @@ END;";
         };
         var overwrite = pending != null;
 
-        await using var conn = new SqlConnection(ConnectionFor(reg.DatabaseName));
+        await using var conn = new SqlConnection(TenantConnection(reg));
         await conn.OpenAsync(ct);
         var changed = 0;
         foreach (var (key, value) in values)
@@ -693,67 +953,159 @@ SELECT @@ROWCOUNT;", conn);
     /// (SuperAdminPanel.dbo.TenantMenuAssignments + every system menu), matched by MenuKey:
     /// assigned = on, the rest = off, and an assigned menu the database doesn't have yet is added
     /// from dbo.TenantMenuItems. With nothing assigned the menus are left as copied.
+    /// The Admin Panel side is read over its own connection and the tenant database is written over the
+    /// tenant's - no cross-database queries, so this also works when the tenant database has its own user.
     /// </summary>
     private async Task<StepResult> ApplyMenusAsync(TenantDatabase reg, int tenantId, CancellationToken ct)
     {
-        var adm = Q(AdminDatabase);
-        var sql = $@"
-SET NOCOUNT ON;
-DECLARE @keys TABLE (MenuKey NVARCHAR(100) COLLATE DATABASE_DEFAULT PRIMARY KEY);
-INSERT @keys (MenuKey)
+        // 1. Admin Panel: the menu catalogue and this tenant's assigned menu keys.
+        var catalogue = new Dictionary<string, AdminMenu>(StringComparer.OrdinalIgnoreCase);
+        var keyById = new Dictionary<int, string>();
+        var keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        await using (var adm = new SqlConnection(BaseConnectionString))
+        {
+            await adm.OpenAsync(ct);
+            await using (var cmd = new SqlCommand(@"
+SELECT MenuItemId, MenuKey, DisplayName, Icon, RoleRestriction, MenuGroup, Route, DisplayOrder,
+       ApplicationCode, IsSystemMenu, IsActive, ParentMenuItemId, ModuleId
+  FROM dbo.TenantMenuItems
+ WHERE MenuKey IS NOT NULL
+ ORDER BY MenuItemId;", adm))
+            await using (var r = await cmd.ExecuteReaderAsync(ct))
+            {
+                while (await r.ReadAsync(ct))
+                {
+                    var key = Convert.ToString(r["MenuKey"])!.Trim();
+                    var id = Convert.ToInt32(r["MenuItemId"]);
+                    keyById[id] = key;
+                    catalogue.TryAdd(key, new AdminMenu(
+                        key,
+                        r["ParentMenuItemId"] is DBNull ? (int?)null : Convert.ToInt32(r["ParentMenuItemId"]),
+                        r["IsSystemMenu"] is not DBNull && Convert.ToBoolean(r["IsSystemMenu"]),
+                        r["IsActive"] is not DBNull && Convert.ToBoolean(r["IsActive"]),
+                        new Dictionary<string, object>
+                        {
+                            ["DisplayName"] = r["DisplayName"], ["Icon"] = r["Icon"], ["RoleRestriction"] = r["RoleRestriction"],
+                            ["MenuGroup"] = r["MenuGroup"], ["Route"] = r["Route"], ["DisplayOrder"] = r["DisplayOrder"],
+                            ["ApplicationCode"] = r["ApplicationCode"], ["IsSystemMenu"] = r["IsSystemMenu"], ["ModuleId"] = r["ModuleId"],
+                        }));
+                }
+            }
+            await using (var cmd = new SqlCommand(@"
 SELECT DISTINCT m.MenuKey
-  FROM {adm}.dbo.TenantMenuAssignments a
-  JOIN {adm}.dbo.TenantMenuItems m ON m.MenuItemId = a.MenuItemId
- WHERE a.TenantId = @tenantId;
-DECLARE @assigned INT = (SELECT COUNT(*) FROM @keys), @added INT = 0, @changed INT = 0;
-IF @assigned > 0
-BEGIN
-    INSERT @keys (MenuKey)
-    SELECT m.MenuKey FROM {adm}.dbo.TenantMenuItems m
-     WHERE m.IsSystemMenu = 1 AND m.IsActive = 1
-       AND NOT EXISTS (SELECT 1 FROM @keys k WHERE k.MenuKey = m.MenuKey COLLATE DATABASE_DEFAULT);
+  FROM dbo.TenantMenuAssignments a
+  JOIN dbo.TenantMenuItems m ON m.MenuItemId = a.MenuItemId
+ WHERE a.TenantId = @tenantId AND m.MenuKey IS NOT NULL;", adm))
+            {
+                cmd.Parameters.AddWithValue("@tenantId", tenantId);
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                while (await r.ReadAsync(ct)) keys.Add(r.GetString(0).Trim());
+            }
+        }
+        var assigned = keys.Count;
 
-    INSERT dbo.MenuItems (MenuKey, DisplayName, Icon, RoleRestriction, IsActive, MenuGroup, Route, DisplayOrder,
-                          ApplicationCode, IsSystemMenu, ParentMenuItemId, CreatedDate, ModuleId)
-    SELECT m.MenuKey, m.DisplayName, m.Icon, m.RoleRestriction, 1, m.MenuGroup, m.Route, m.DisplayOrder,
-           m.ApplicationCode, m.IsSystemMenu, NULL, SYSUTCDATETIME(), m.ModuleId
-      FROM {adm}.dbo.TenantMenuItems m
-      JOIN @keys k ON k.MenuKey = m.MenuKey COLLATE DATABASE_DEFAULT
-     WHERE NOT EXISTS (SELECT 1 FROM dbo.MenuItems t WHERE t.MenuKey = k.MenuKey);
-    SET @added = @@ROWCOUNT;
-
-    IF @added > 0
-        UPDATE t SET t.ParentMenuItemId = tp.MenuItemId
-          FROM dbo.MenuItems t
-          JOIN {adm}.dbo.TenantMenuItems m  ON m.MenuKey COLLATE DATABASE_DEFAULT = t.MenuKey
-          JOIN {adm}.dbo.TenantMenuItems mp ON mp.MenuItemId = m.ParentMenuItemId
-          JOIN dbo.MenuItems tp ON tp.MenuKey = mp.MenuKey COLLATE DATABASE_DEFAULT
-         WHERE t.ParentMenuItemId IS NULL;
-
-    UPDATE t
-       SET t.IsActive = CASE WHEN k.MenuKey IS NULL THEN 0 ELSE 1 END, t.ModifiedDate = SYSUTCDATETIME()
-      FROM dbo.MenuItems t
-      LEFT JOIN @keys k ON k.MenuKey = t.MenuKey
-     WHERE t.IsActive <> CASE WHEN k.MenuKey IS NULL THEN 0 ELSE 1 END;
-    SET @changed = @@ROWCOUNT;
-END;
-SELECT @assigned, @added, @changed,
-       (SELECT COUNT(*) FROM dbo.MenuItems WHERE IsActive = 1), (SELECT COUNT(*) FROM dbo.MenuItems);";
-        await using var conn = new SqlConnection(ConnectionFor(reg.DatabaseName));
+        // 2. Tenant database.
+        await using var conn = new SqlConnection(TenantConnection(reg));
         await conn.OpenAsync(ct);
-        await using var cmd = new SqlCommand(sql, conn) { CommandTimeout = 300 };
-        cmd.Parameters.AddWithValue("@tenantId", tenantId);
-        await using var r = await cmd.ExecuteReaderAsync(ct);
-        await r.ReadAsync(ct);
-        int assigned = r.GetInt32(0), added = r.GetInt32(1), changed = r.GetInt32(2), on = r.GetInt32(3), total = r.GetInt32(4);
+
+        async Task<(int On, int Total)> CountAsync(SqlTransaction? tx)
+        {
+            await using var cmd = new SqlCommand("SELECT (SELECT COUNT(*) FROM dbo.MenuItems WHERE IsActive = 1), (SELECT COUNT(*) FROM dbo.MenuItems);", conn, tx);
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            await r.ReadAsync(ct);
+            return (r.GetInt32(0), r.GetInt32(1));
+        }
+
         var warnings = new List<string>();
         if (assigned == 0)
         {
+            var (on0, total0) = await CountAsync(null);
             warnings.Add("No menus are assigned to this tenant yet - all copied menus are left on. Pick them under Modules and menus.");
-            return new StepResult(false, $"{on} of {total} menus on (none assigned yet)", warnings);
+            return new StepResult(false, $"{on0} of {total0} menus on (none assigned yet)", warnings);
         }
+
+        // Every active system menu is always on.
+        foreach (var m in catalogue.Values.Where(x => x.IsSystem && x.IsActive)) keys.Add(m.Key);
+
+        // Tenant menus as they are now: key -> on/off (rows without a key count as off).
+        var existing = new Dictionary<string, bool?>(StringComparer.OrdinalIgnoreCase);
+        await using (var cmd = new SqlCommand("SELECT MenuKey, IsActive FROM dbo.MenuItems WHERE MenuKey IS NOT NULL;", conn))
+        await using (var r = await cmd.ExecuteReaderAsync(ct))
+        {
+            while (await r.ReadAsync(ct))
+            {
+                var key = r.GetString(0).Trim();
+                var active = !r.IsDBNull(1) && Convert.ToBoolean(r.GetValue(1));
+                // the same key twice with different states = null, so the update below sets every copy
+                existing[key] = existing.TryGetValue(key, out var seen) && seen != active ? (bool?)null : active;
+            }
+        }
+
+        int added = 0, changed = 0;
+        await using var tran = (SqlTransaction)await conn.BeginTransactionAsync(ct);
+        try
+        {
+            // Assigned menus the database does not have yet - added from the catalogue (parent linked below).
+            foreach (var key in keys.Where(k => !existing.ContainsKey(k)))
+            {
+                if (!catalogue.TryGetValue(key, out var m)) continue;
+                await using var ins = new SqlCommand(@"
+INSERT dbo.MenuItems (MenuKey, DisplayName, Icon, RoleRestriction, IsActive, MenuGroup, Route, DisplayOrder,
+                      ApplicationCode, IsSystemMenu, ParentMenuItemId, CreatedDate, ModuleId)
+VALUES (@MenuKey, @DisplayName, @Icon, @RoleRestriction, 1, @MenuGroup, @Route, @DisplayOrder,
+        @ApplicationCode, @IsSystemMenu, NULL, SYSUTCDATETIME(), @ModuleId);", conn, tran);
+                ins.Parameters.AddWithValue("@MenuKey", m.Key);
+                foreach (var (column, value) in m.Values) ins.Parameters.AddWithValue("@" + column, value);
+                await ins.ExecuteNonQueryAsync(ct);
+                added++;
+            }
+
+            if (added > 0)
+            {
+                // Same parent as in the catalogue, matched by MenuKey.
+                foreach (var m in catalogue.Values)
+                {
+                    if (m.ParentId is not int parentId || !keyById.TryGetValue(parentId, out var parentKey)) continue;
+                    await using var link = new SqlCommand(@"
+UPDATE t SET t.ParentMenuItemId = (SELECT TOP (1) p.MenuItemId FROM dbo.MenuItems p WHERE p.MenuKey = @parent ORDER BY p.MenuItemId)
+  FROM dbo.MenuItems t
+ WHERE t.MenuKey = @key AND t.ParentMenuItemId IS NULL
+   AND EXISTS (SELECT 1 FROM dbo.MenuItems p WHERE p.MenuKey = @parent);", conn, tran);
+                    link.Parameters.AddWithValue("@key", m.Key);
+                    link.Parameters.AddWithValue("@parent", parentKey);
+                    await link.ExecuteNonQueryAsync(ct);
+                }
+            }
+
+            // Assigned = on, the rest = off.
+            foreach (var (key, isOn) in existing)
+            {
+                var wanted = keys.Contains(key);
+                if (isOn == wanted) continue;
+                await using var set = new SqlCommand(
+                    "UPDATE dbo.MenuItems SET IsActive = @on, ModifiedDate = SYSUTCDATETIME() WHERE MenuKey = @key AND IsActive <> @on;", conn, tran);
+                set.Parameters.AddWithValue("@on", wanted);
+                set.Parameters.AddWithValue("@key", key);
+                changed += await set.ExecuteNonQueryAsync(ct);
+            }
+            await using (var noKey = new SqlCommand(
+                "UPDATE dbo.MenuItems SET IsActive = 0, ModifiedDate = SYSUTCDATETIME() WHERE MenuKey IS NULL AND IsActive = 1;", conn, tran))
+                changed += await noKey.ExecuteNonQueryAsync(ct);
+
+            await tran.CommitAsync(ct);
+        }
+        catch
+        {
+            await tran.RollbackAsync(ct);
+            throw;
+        }
+
+        var (on, total) = await CountAsync(null);
         return new StepResult(added + changed > 0, $"{on} of {total} menus on" + (added > 0 ? $", {added} added" : ""), warnings);
     }
+
+    /// <summary>One row of SuperAdminPanel.dbo.TenantMenuItems; Values = the columns copied into the tenant's dbo.MenuItems.</summary>
+    private sealed record AdminMenu(string Key, int? ParentId, bool IsSystem, bool IsActive, Dictionary<string, object> Values);
 
     /// <summary>
     /// The Administrator role gets every right (view, add, edit, delete, import, export) on every
@@ -781,7 +1133,7 @@ DECLARE @added INT = @@ROWCOUNT;
 
 SELECT (SELECT RoleName FROM dbo.Roles WHERE RoleId = @roleId), @removed + @updated + @added,
        (SELECT COUNT(*) FROM dbo.RolePermissions WHERE RoleId = @roleId);";
-        await using var conn = new SqlConnection(ConnectionFor(reg.DatabaseName));
+        await using var conn = new SqlConnection(TenantConnection(reg));
         await conn.OpenAsync(ct);
         await using var cmd = new SqlCommand(sql, conn) { CommandTimeout = 300 };
         await using var r = await cmd.ExecuteReaderAsync(ct);
@@ -814,7 +1166,7 @@ ELSE
     UPDATE dbo.Users SET RoleId = @roleId, Status = N'Active', ModifiedDate = SYSUTCDATETIME() WHERE UserId = @userId;
 
 SELECT @userId;";
-        await using var conn = new SqlConnection(ConnectionFor(reg.DatabaseName));
+        await using var conn = new SqlConnection(TenantConnection(reg));
         await conn.OpenAsync(ct);
         await using var cmd = new SqlCommand(sql, conn);
         cmd.Parameters.AddWithValue("@first", (object?)reg.OwnerFirstName ?? reg.OwnerEmail!);
@@ -862,12 +1214,14 @@ SELECT ISNULL(@owner, @tenantId);", conn);
             }
         }
 
+        // With its own database user the Business Panel opens the database with that user (it reads it from the
+        // tenant directory), and that user cannot add other logins anyway - nothing to grant.
         var apiLogin = (_config["TenantDatabase:BusinessApiLogin"] ?? string.Empty).Trim();
-        if (apiLogin.Length > 0)
+        if (apiLogin.Length > 0 && !HasOwnLogin(reg))
         {
             try
             {
-                await using var conn = new SqlConnection(ConnectionFor(reg.DatabaseName));
+                await using var conn = new SqlConnection(TenantConnection(reg));
                 await conn.OpenAsync(ct);
                 await using var cmd = new SqlCommand(@"
 SET NOCOUNT ON;
@@ -898,34 +1252,55 @@ SELECT 1;", conn);
     /// Each table is copied once automatically (remembered in dbo.SchemaVersions as Kind 'Template');
     /// Re-seed copies again. Only rows whose primary key is not there yet are inserted.
     /// A table that fails is reported as a warning and the rest carry on.
+    /// The template is read over the API's own connection and the rows are written over the tenant's
+    /// connection - no cross-database query, so this also works when the tenant database has its own user.
     /// </summary>
-    private async Task<ScriptRun> CopyTemplateDataAsync(string database, bool forceAll, CancellationToken ct)
+    private async Task<ScriptRun> CopyTemplateDataAsync(TenantDatabase reg, bool forceAll, CancellationToken ct)
     {
         var applied = new List<string>();
         var warnings = new List<string>();
         var template = TemplateDatabase;
+        var database = reg.DatabaseName;
         if (template.Length == 0 || string.Equals(template, database, StringComparison.OrdinalIgnoreCase))
             return new ScriptRun(applied, null, warnings);
 
-        await using var conn = new SqlConnection(ConnectionFor(database));
-        await conn.OpenAsync(ct);
-
-        await using (var exists = new SqlCommand("SELECT DB_ID(@n)", conn))
+        await using var src = new SqlConnection(ConnectionFor(template));
+        try
         {
-            exists.Parameters.AddWithValue("@n", template);
-            if (await exists.ExecuteScalarAsync(ct) is null or DBNull)
-            {
-                warnings.Add($"Template database {template} not found - master data not copied.");
-                return new ScriptRun(applied, null, warnings);
-            }
+            await src.OpenAsync(ct);
         }
+        catch (SqlException ex)
+        {
+            warnings.Add($"Template database {template} not found or {LoginText} cannot open it ({ex.Message}) - master data not copied.");
+            return new ScriptRun(applied, null, warnings);
+        }
+
+        await using var conn = new SqlConnection(TenantConnection(reg));
+        await conn.OpenAsync(ct);
 
         var done = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         await using (var read = new SqlCommand("SELECT ScriptName FROM dbo.SchemaVersions WHERE Kind = N'Template'", conn))
         await using (var r = await read.ExecuteReaderAsync(ct))
             while (await r.ReadAsync(ct)) done.Add(r.GetString(0));
 
-        var tq = Q(template);
+        const string ColumnsSql = @"
+SELECT c.name
+  FROM sys.columns c
+ WHERE c.object_id = OBJECT_ID(@t, N'U')
+   AND c.is_computed = 0
+   AND TYPE_NAME(c.user_type_id) NOT IN (N'timestamp', N'rowversion')
+ ORDER BY c.column_id;";
+
+        async Task<List<string>> ColumnsAsync(SqlConnection c, string table)
+        {
+            var list = new List<string>();
+            await using var cmd = new SqlCommand(ColumnsSql, c);
+            cmd.Parameters.AddWithValue("@t", "dbo." + Q(table));
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct)) list.Add(r.GetString(0));
+            return list;
+        }
+
         string? last = null;
         foreach (var table in TemplateTables)
         {
@@ -933,21 +1308,8 @@ SELECT 1;", conn);
             if (!forceAll && done.Contains(marker)) { last = marker; continue; }
 
             // Columns present in both databases (computed / rowversion columns cannot be inserted).
-            var columns = new List<string>();
-            await using (var cols = new SqlCommand($@"
-SELECT c.name
-  FROM sys.columns c
- WHERE c.object_id = OBJECT_ID(@t, N'U')
-   AND c.is_computed = 0
-   AND TYPE_NAME(c.user_type_id) NOT IN (N'timestamp', N'rowversion')
-   AND EXISTS (SELECT 1 FROM {tq}.sys.columns s WHERE s.object_id = OBJECT_ID(@tt, N'U') AND s.name = c.name)
- ORDER BY c.column_id;", conn))
-            {
-                cols.Parameters.AddWithValue("@t", "dbo." + Q(table));
-                cols.Parameters.AddWithValue("@tt", $"{tq}.dbo.{Q(table)}");
-                await using var r = await cols.ExecuteReaderAsync(ct);
-                while (await r.ReadAsync(ct)) columns.Add(r.GetString(0));
-            }
+            var templateColumns = new HashSet<string>(await ColumnsAsync(src, table), StringComparer.OrdinalIgnoreCase);
+            var columns = (await ColumnsAsync(conn, table)).Where(templateColumns.Contains).ToList();
             if (columns.Count == 0)
             {
                 warnings.Add($"Master data {table}: table missing in {database} or {template} - skipped.");
@@ -967,6 +1329,9 @@ SELECT c.name
                 await using var r = await pk.ExecuteReaderAsync(ct);
                 while (await r.ReadAsync(ct)) keys.Add(r.GetString(0));
             }
+            // A key column the template does not have cannot be matched - treat the table as keyless.
+            var keyIndexes = keys.Select(k => columns.FindIndex(c => string.Equals(c, k, StringComparison.OrdinalIgnoreCase))).ToList();
+            if (keyIndexes.Any(i => i < 0)) keyIndexes.Clear();
 
             bool hasIdentity;
             await using (var id = new SqlCommand("SELECT CAST(OBJECTPROPERTY(OBJECT_ID(@t, N'U'), 'TableHasIdentity') AS INT)", conn))
@@ -976,49 +1341,118 @@ SELECT c.name
             }
 
             var list = string.Join(", ", columns.Select(Q));
-            var src = $"{tq}.dbo.{Q(table)}";
             var dst = "dbo." + Q(table);
-            // Missing rows only (by primary key); a table without a key is copied only while empty.
-            var filter = keys.Count > 0
-                ? $"WHERE NOT EXISTS (SELECT 1 FROM {dst} d WHERE {string.Join(" AND ", keys.Select(k => $"d.{Q(k)} = s.{Q(k)}"))})"
-                : $"WHERE NOT EXISTS (SELECT 1 FROM {dst})";
-            var sql = new StringBuilder();
-            if (hasIdentity) sql.Append($"SET IDENTITY_INSERT {dst} ON;\n");
-            sql.Append($"INSERT INTO {dst} ({list}) SELECT {string.Join(", ", columns.Select(c => "s." + Q(c)))} FROM {src} s {filter};\n");
-            sql.Append("DECLARE @rows INT = @@ROWCOUNT;\n");
-            if (hasIdentity) sql.Append($"SET IDENTITY_INSERT {dst} OFF;\n");
-            sql.Append("SELECT @rows;");
-
-            await using var tx = (SqlTransaction)await conn.BeginTransactionAsync(ct);
             try
             {
-                int rows;
-                await using (var cmd = new SqlCommand(sql.ToString(), conn, tx) { CommandTimeout = 600 })
-                    rows = Convert.ToInt32(await cmd.ExecuteScalarAsync(ct) ?? 0);
-
-                var checksum = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(template + "|" + list)));
-                await using (var mark = new SqlCommand(
-                    "MERGE dbo.SchemaVersions AS t USING (SELECT @n AS ScriptName) AS s ON t.ScriptName = s.ScriptName " +
-                    "WHEN MATCHED THEN UPDATE SET Checksum = @c, Kind = N'Template', AppliedDate = SYSUTCDATETIME() " +
-                    "WHEN NOT MATCHED THEN INSERT (ScriptName, Kind, Checksum, AppliedDate) VALUES (@n, N'Template', @c, SYSUTCDATETIME());", conn, tx))
+                // Template rows.
+                var rows = new List<object[]>();
+                await using (var cmd = new SqlCommand($"SELECT {list} FROM {dst};", src) { CommandTimeout = 600 })
+                await using (var r = await cmd.ExecuteReaderAsync(ct))
                 {
-                    mark.Parameters.AddWithValue("@n", marker);
-                    mark.Parameters.AddWithValue("@c", checksum);
-                    await mark.ExecuteNonQueryAsync(ct);
+                    while (await r.ReadAsync(ct))
+                    {
+                        var values = new object[columns.Count];
+                        r.GetValues(values);
+                        rows.Add(values);
+                    }
                 }
-                await tx.CommitAsync(ct);
-                if (rows > 0) applied.Add($"MasterData/{table} ({rows} rows from {template})");
-                last = marker;
+
+                // Missing rows only (by primary key); a table without a key is copied only while empty.
+                List<object[]> missing;
+                if (keyIndexes.Count > 0)
+                {
+                    var have = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    await using (var cmd = new SqlCommand($"SELECT {string.Join(", ", keyIndexes.Select(i => Q(columns[i])))} FROM {dst};", conn) { CommandTimeout = 600 })
+                    await using (var r = await cmd.ExecuteReaderAsync(ct))
+                    {
+                        while (await r.ReadAsync(ct))
+                        {
+                            var values = new object[keyIndexes.Count];
+                            r.GetValues(values);
+                            have.Add(RowKey(values));
+                        }
+                    }
+                    missing = rows.Where(row => !have.Contains(RowKey(keyIndexes.Select(i => row[i]).ToArray()))).ToList();
+                }
+                else
+                {
+                    await using var cmd = new SqlCommand($"SELECT CASE WHEN EXISTS (SELECT 1 FROM {dst}) THEN 1 ELSE 0 END;", conn);
+                    missing = Convert.ToInt32(await cmd.ExecuteScalarAsync(ct)) == 1 ? new List<object[]>() : rows;
+                }
+
+                await using var tx = (SqlTransaction)await conn.BeginTransactionAsync(ct);
+                try
+                {
+                    var inserted = 0;
+                    // Several rows per INSERT, under SQL Server's 2100-parameter / 1000-row limits.
+                    var perBatch = Math.Max(1, Math.Min(1000, 2000 / columns.Count));
+                    for (var start = 0; start < missing.Count; start += perBatch)
+                    {
+                        var batch = missing.Skip(start).Take(perBatch).ToList();
+                        var sql = new StringBuilder();
+                        if (hasIdentity) sql.Append($"SET IDENTITY_INSERT {dst} ON;\n");
+                        sql.Append($"INSERT INTO {dst} ({list}) VALUES ");
+                        await using var cmd = new SqlCommand { Connection = conn, Transaction = tx, CommandTimeout = 600 };
+                        for (var row = 0; row < batch.Count; row++)
+                        {
+                            if (row > 0) sql.Append(", ");
+                            sql.Append('(');
+                            for (var col = 0; col < columns.Count; col++)
+                            {
+                                var name = $"@p{row}_{col}";
+                                if (col > 0) sql.Append(", ");
+                                sql.Append(name);
+                                cmd.Parameters.Add(ParameterFor(name, batch[row][col]));
+                            }
+                            sql.Append(')');
+                        }
+                        sql.Append(";\n");
+                        if (hasIdentity) sql.Append($"SET IDENTITY_INSERT {dst} OFF;");
+                        cmd.CommandText = sql.ToString();
+                        await cmd.ExecuteNonQueryAsync(ct);
+                        inserted += batch.Count;
+                    }
+
+                    var checksum = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(template + "|" + list)));
+                    await using (var mark = new SqlCommand(
+                        "MERGE dbo.SchemaVersions AS t USING (SELECT @n AS ScriptName) AS s ON t.ScriptName = s.ScriptName " +
+                        "WHEN MATCHED THEN UPDATE SET Checksum = @c, Kind = N'Template', AppliedDate = SYSUTCDATETIME() " +
+                        "WHEN NOT MATCHED THEN INSERT (ScriptName, Kind, Checksum, AppliedDate) VALUES (@n, N'Template', @c, SYSUTCDATETIME());", conn, tx))
+                    {
+                        mark.Parameters.AddWithValue("@n", marker);
+                        mark.Parameters.AddWithValue("@c", checksum);
+                        await mark.ExecuteNonQueryAsync(ct);
+                    }
+                    await tx.CommitAsync(ct);
+                    if (inserted > 0) applied.Add($"MasterData/{table} ({inserted} rows from {template})");
+                    last = marker;
+                }
+                catch
+                {
+                    await tx.RollbackAsync(ct);
+                    throw;
+                }
             }
-            catch (Exception ex)
+            catch (Exception ex) when (ex is SqlException or InvalidOperationException)
             {
-                await tx.RollbackAsync(ct);
                 _logger.LogWarning(ex, "Copying {Table} from {Template} into {Db} failed", table, template, database);
                 warnings.Add($"Master data {table}: {ex.Message}");
             }
         }
         return new ScriptRun(applied, last, warnings);
     }
+
+    /// <summary>Primary-key values as one comparable text (case-insensitive, like SQL Server's default collation).</summary>
+    private static string RowKey(object[] values) =>
+        string.Join("\u001F", values.Select(v => v is DBNull or null ? "\u0000" : Convert.ToString(v, System.Globalization.CultureInfo.InvariantCulture)));
+
+    /// <summary>A parameter for a copied value; dates as datetime2 so no value is rounded or out of range.</summary>
+    private static SqlParameter ParameterFor(string name, object value) => value switch
+    {
+        DateTime d => new SqlParameter(name, System.Data.SqlDbType.DateTime2) { Value = d },
+        byte[] b => new SqlParameter(name, System.Data.SqlDbType.VarBinary, -1) { Value = b },
+        _ => new SqlParameter(name, value ?? DBNull.Value),
+    };
 
     // ------------------------------------------------------------------ helpers
 
@@ -1054,9 +1488,87 @@ SELECT c.name
         return Convert.ToInt32(await cmd.ExecuteScalarAsync(ct)) == 1;
     }
 
-    private async Task EnsureVersionsTableAsync(string database, CancellationToken ct)
+    /// <summary>Automatic mode: CREATE DATABASE, with a clear message when the API's login is not allowed to.</summary>
+    private async Task<bool> CreateDatabaseAutomaticAsync(string database, CancellationToken ct)
     {
-        await using var conn = new SqlConnection(ConnectionFor(database));
+        try
+        {
+            return await CreateDatabaseIfMissingAsync(database, ct);
+        }
+        catch (SqlException ex) when (ex.Number is 262 or 1802 or 5011)
+        {
+            throw new InvalidOperationException(
+                $"SQL login {LoginText} is not allowed to create databases on this server ({ex.Message}) " +
+                $"Either switch this tenant to Manual: create database {database} yourself (Plesk > Databases > Add Database, " +
+                $"exact name {database}, {LoginText} as owner) and click Run again - or have the SQL Server administrator run " +
+                $"USE [master]; CREATE USER [{SqlLogin ?? "login"}] FOR LOGIN [{SqlLogin ?? "login"}]; GRANT CREATE DATABASE TO [{SqlLogin ?? "login"}];", ex);
+        }
+    }
+
+    /// <summary>
+    /// Manual mode: the database must already exist and whoever opens it (its own user, or else the API's login)
+    /// must be able to open it, read, write and create tables in it. Throws a message that tells the operator
+    /// exactly what to do.
+    /// </summary>
+    private async Task EnsureManualDatabaseUsableAsync(TenantDatabase reg, CancellationToken ct)
+    {
+        var database = reg.DatabaseName;
+        var own = HasOwnLogin(reg);
+        var who = WhoText(reg);
+        try
+        {
+            await using var conn = new SqlConnection(TenantConnection(reg));
+            await conn.OpenAsync(ct);
+            await using var cmd = new SqlCommand(@"
+SELECT ISNULL(HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE TABLE'), 0)
+     & ISNULL(HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'SELECT'), 0)
+     & ISNULL(HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'INSERT'), 0)
+     & ISNULL(HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'UPDATE'), 0)", conn);
+            if (Convert.ToInt32(await cmd.ExecuteScalarAsync(ct)) != 1)
+                throw new InvalidOperationException(own
+                    ? $"Database {database} opens with {who}, but that user cannot read, write and create tables in it. " +
+                      $"In Plesk open Databases > {database} > User Management and give {reg.DbUser} \"Read and Write\" access, then run again."
+                    : $"Database {database} exists, but {LoginText} cannot create tables in it. " +
+                      $"In Plesk open the database > User Management and give {LoginText} full (db_owner) access - or enter the " +
+                      $"database's own Plesk user and password on the Manual panel - then click Run again.");
+        }
+        catch (SqlException ex) when (ex.Number is 4060 or 916 or 18456)
+        {
+            if (own && ex.Number == 18456)
+                throw new InvalidOperationException(
+                    $"Database user {reg.DbUser} could not sign in to SQL Server - the user name or password is wrong, or the user " +
+                    $"belongs to another server. Check it in Plesk (Databases > {database} > User Management), enter it again and run again.", ex);
+
+            bool exists;
+            try
+            {
+                await using var master = new SqlConnection(ConnectionFor("master"));
+                await master.OpenAsync(ct);
+                await using var check = new SqlCommand("SELECT CASE WHEN DB_ID(@n) IS NULL THEN 0 ELSE 1 END", master);
+                check.Parameters.AddWithValue("@n", database);
+                exists = Convert.ToInt32(await check.ExecuteScalarAsync(ct)) == 1;
+            }
+            catch (SqlException)
+            {
+                exists = false;
+            }
+            if (own)
+                throw new InvalidOperationException(exists
+                    ? $"Database {database} exists, but database user {reg.DbUser} cannot open it. In Plesk open Databases > {database} > " +
+                      $"User Management and make sure {reg.DbUser} is a user of this database, then run again."
+                    : $"Manual database: {database} has not been created yet. In Plesk go to Databases > Add Database, use the exact name " +
+                      $"{database} on this SQL server with user {reg.DbUser}, then run again.", ex);
+            throw new InvalidOperationException(exists
+                ? $"Database {database} exists, but {LoginText} cannot open it. Enter the database's own Plesk user and password on " +
+                  $"the Manual panel - or in Plesk add {LoginText} to it with full (db_owner) access - then click Run again."
+                : $"Manual database: {database} has not been created yet. In Plesk go to Databases > Add Database, use the exact name " +
+                  $"{database} on this SQL server, enter its user and password on the Manual panel, then click Run again.", ex);
+        }
+    }
+
+    private async Task EnsureVersionsTableAsync(TenantDatabase reg, CancellationToken ct)
+    {
+        await using var conn = new SqlConnection(TenantConnection(reg));
         await conn.OpenAsync(ct);
         const string sql = @"IF OBJECT_ID(N'dbo.SchemaVersions', N'U') IS NULL
 CREATE TABLE dbo.SchemaVersions
@@ -1105,6 +1617,9 @@ IF COL_LENGTH(N'dbo.TenantDatabases', N'OwnerUserId') IS NULL ALTER TABLE dbo.Te
 IF COL_LENGTH(N'dbo.TenantDatabases', N'VerifiedDate') IS NULL ALTER TABLE dbo.TenantDatabases ADD VerifiedDate DATETIME2(7) NULL;
 IF COL_LENGTH(N'dbo.TenantDatabases', N'VerifiedBy') IS NULL ALTER TABLE dbo.TenantDatabases ADD VerifiedBy NVARCHAR(200) NULL;
 IF COL_LENGTH(N'dbo.TenantDatabases', N'SettingsJson') IS NULL ALTER TABLE dbo.TenantDatabases ADD SettingsJson NVARCHAR(MAX) NULL;
+IF COL_LENGTH(N'dbo.TenantDatabases', N'DatabaseMode') IS NULL ALTER TABLE dbo.TenantDatabases ADD DatabaseMode NVARCHAR(10) NOT NULL CONSTRAINT DF_TenantDatabases_DatabaseMode DEFAULT (N'Automatic');
+IF COL_LENGTH(N'dbo.TenantDatabases', N'DbUser') IS NULL ALTER TABLE dbo.TenantDatabases ADD DbUser NVARCHAR(128) NULL;
+IF COL_LENGTH(N'dbo.TenantDatabases', N'DbPassword') IS NULL ALTER TABLE dbo.TenantDatabases ADD DbPassword NVARCHAR(500) NULL;
 -- Start / finish time of every provisioning step, per tenant.
 IF OBJECT_ID(N'dbo.TenantProvisioningSteps', N'U') IS NULL
 BEGIN

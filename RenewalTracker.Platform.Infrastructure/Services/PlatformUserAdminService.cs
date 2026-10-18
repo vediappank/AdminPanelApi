@@ -10,10 +10,12 @@ namespace RenewalTracker.Platform.Infrastructure.Services;
 public class PlatformUserAdminService : IPlatformUserAdminService
 {
     private readonly PlatformDbContext _db;
+    private readonly IPlatformContactUniquenessService _unique;
 
-    public PlatformUserAdminService(PlatformDbContext db)
+    public PlatformUserAdminService(PlatformDbContext db, IPlatformContactUniquenessService unique)
     {
         _db = db;
+        _unique = unique;
     }
 
     public async Task<List<PlatformUserDto>> SearchAsync(string? search)
@@ -22,7 +24,7 @@ public class PlatformUserAdminService : IPlatformUserAdminService
         if (!string.IsNullOrWhiteSpace(search))
         {
             var s = search.Trim();
-            query = query.Where(u => u.Email.Contains(s) || u.FirstName.Contains(s) || (u.LastName != null && u.LastName.Contains(s)));
+            query = query.Where(u => u.Email.Contains(s) || u.FirstName.Contains(s) || (u.LastName != null && u.LastName.Contains(s)) || (u.Mobile != null && u.Mobile.Contains(s)));
         }
 
         var users = await query.OrderBy(u => u.FirstName).ToListAsync();
@@ -32,9 +34,10 @@ public class PlatformUserAdminService : IPlatformUserAdminService
 
     public async Task<PlatformUserDto> CreateAsync(CreatePlatformUserDto dto)
     {
-        if (await _db.PlatformUsers.AnyAsync(u => u.Email == dto.Email))
+        // one e-mail / one mobile per platform user; the e-mail is not also a Business Panel login
+        if (await _unique.PlatformUserProblemAsync(dto.Email, dto.Mobile, null) is string problem)
         {
-            throw new InvalidOperationException($"A platform user with email '{dto.Email}' already exists.");
+            throw new InvalidOperationException(problem);
         }
         if (!await _db.PlatformRoles.AnyAsync(r => r.PlatformRoleId == dto.PlatformRoleId))
         {
@@ -45,7 +48,8 @@ public class PlatformUserAdminService : IPlatformUserAdminService
         {
             FirstName = dto.FirstName,
             LastName = dto.LastName,
-            Email = dto.Email,
+            Email = dto.Email.Trim(),
+            Mobile = string.IsNullOrWhiteSpace(dto.Mobile) ? null : dto.Mobile.Trim(),
             Status = "Active",
             CreatedDate = DateTime.UtcNow,
             PasswordHash = PasswordHasher.Hash(dto.InitialPassword),
@@ -80,9 +84,9 @@ public class PlatformUserAdminService : IPlatformUserAdminService
         var entity = await _db.PlatformUsers.FirstOrDefaultAsync(u => u.PlatformUserId == platformUserId);
         if (entity == null) return null;
 
-        if (await _db.PlatformUsers.AnyAsync(u => u.PlatformUserId != platformUserId && u.Email == dto.Email))
+        if (await _unique.PlatformUserProblemAsync(dto.Email, dto.Mobile, platformUserId) is string problem)
         {
-            throw new InvalidOperationException($"A platform user with email '{dto.Email}' already exists.");
+            throw new InvalidOperationException(problem);
         }
         if (!await _db.PlatformRoles.AnyAsync(r => r.PlatformRoleId == dto.PlatformRoleId))
         {
@@ -91,7 +95,8 @@ public class PlatformUserAdminService : IPlatformUserAdminService
 
         entity.FirstName = dto.FirstName;
         entity.LastName = dto.LastName;
-        entity.Email = dto.Email;
+        entity.Email = dto.Email.Trim();
+        entity.Mobile = string.IsNullOrWhiteSpace(dto.Mobile) ? null : dto.Mobile.Trim();
         entity.PlatformRoleId = dto.PlatformRoleId;
         entity.Status = dto.Status;
         entity.ModifiedDate = DateTime.UtcNow;
@@ -121,6 +126,7 @@ public class PlatformUserAdminService : IPlatformUserAdminService
         FirstName = u.FirstName,
         LastName = u.LastName,
         Email = u.Email,
+        Mobile = u.Mobile,
         Status = u.Status,
         CreatedDate = u.CreatedDate,
         PlatformRoleId = u.PlatformRoleId,

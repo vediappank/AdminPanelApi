@@ -6,6 +6,7 @@ public class PlatformUserDto
     public string FirstName { get; set; } = string.Empty;
     public string? LastName { get; set; }
     public string Email { get; set; } = string.Empty;
+    public string? Mobile { get; set; }
     public string Status { get; set; } = string.Empty;
     public DateTime CreatedDate { get; set; }
 
@@ -18,6 +19,7 @@ public class CreatePlatformUserDto
     public string FirstName { get; set; } = string.Empty;
     public string? LastName { get; set; }
     public string Email { get; set; } = string.Empty;
+    public string? Mobile { get; set; }
     public string InitialPassword { get; set; } = string.Empty;
     public int PlatformRoleId { get; set; }
 }
@@ -33,6 +35,7 @@ public class UpdatePlatformUserDto
     public string FirstName { get; set; } = string.Empty;
     public string? LastName { get; set; }
     public string Email { get; set; } = string.Empty;
+    public string? Mobile { get; set; }
     public int PlatformRoleId { get; set; }
     public string Status { get; set; } = "Active";
 }

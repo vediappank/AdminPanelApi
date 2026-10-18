@@ -20,7 +20,20 @@ public interface ITenantDatabaseService
     /// schema, master data and the owner user straight away. Returns at once - progress is shown live
     /// on the Control Center.
     /// </summary>
-    Task QueueProvisioningAsync(int tenantId, TenantOwnerLogin? owner, TenantSettings? settings = null, CancellationToken ct = default);
+    Task QueueProvisioningAsync(int tenantId, TenantOwnerLogin? owner, TenantSettings? settings = null, TenantDatabaseOptions? database = null, CancellationToken ct = default);
+
+    /// <summary>
+    /// Changes how the tenant's database is created (Automatic / Manual) and its name - only while the
+    /// database step has not been done yet. runNow = queue the provisioning run straight away.
+    /// </summary>
+    Task<TenantDatabaseRunResult> SetDatabaseOptionsAsync(int tenantId, TenantDatabaseOptions options, bool runNow, CancellationToken ct = default);
+
+    /// <summary>Checks a mode / name before anything is created (Provision tenant). forTenantId = the tenant being
+    /// completed (its own database name is fine). Returns an error text, or null when fine.</summary>
+    Task<string?> ValidateDatabaseOptionsAsync(TenantDatabaseOptions? options, int? forTenantId, CancellationToken ct = default);
+
+    /// <summary>Default mode, suggested database name and the API's SQL login - for the Provision tenant form.</summary>
+    Task<TenantDatabaseDefaults> GetDatabaseDefaultsAsync(string? tenantCode, CancellationToken ct = default);
 
     /// <summary>Re-runs every MasterData script (they must be safe to run twice).</summary>
     Task<TenantDatabaseRunResult> ReseedAsync(int tenantId, CancellationToken ct = default);
@@ -53,6 +66,30 @@ public record TenantProvisioningStepInfo(int StepNo, string StepName, DateTime? 
 
 /// <summary>Tenant configuration entered on Provision tenant (empty = default: dd-MM-yyyy, UTC, USD).</summary>
 public record TenantSettings(string? DateFormat, string? TimeZone, string? Currency);
+
+/// <summary>Database creation modes - see TenantDatabase.DatabaseMode.</summary>
+public static class TenantDatabaseModes
+{
+    public const string Automatic = "Automatic";
+    public const string Manual = "Manual";
+
+    /// <summary>"manual" / "Manual" -> Manual, anything else (or empty) -> null.</summary>
+    public static string? Normalize(string? mode) =>
+        string.Equals(mode?.Trim(), Manual, StringComparison.OrdinalIgnoreCase) ? Manual
+        : string.Equals(mode?.Trim(), Automatic, StringComparison.OrdinalIgnoreCase) ? Automatic
+        : null;
+}
+
+/// <summary>Chosen on Provision tenant / the provisioning screen. Null values = keep / use the default
+/// (mode: TenantDatabase:DefaultMode, name: prefix + tenant code).
+/// Manual mode: DbUser / DbPassword = the database's own SQL user (the one Plesk creates with the database).
+/// DbUser null = keep, "" = none (use the API's own login). DbPassword empty = keep the saved one (same user only).</summary>
+public record TenantDatabaseOptions(string? Mode, string? DatabaseName, string? DbUser = null, string? DbPassword = null);
+
+/// <summary>What the Provision tenant form pre-selects. SqlLogin = the login the API connects with -
+/// in Manual mode either that login owns the database you create, or you enter the database's own user.
+/// CanStoreDbPassword = TenantDatabase:CredentialKey is set (needed to save a database user's password).</summary>
+public record TenantDatabaseDefaults(string DefaultMode, string SuggestedDatabaseName, string Prefix, string? SqlLogin, bool Enabled, bool CanStoreDbPassword);
 
 /// <summary>The tenant's first admin (owner) login entered on Provision tenant.</summary>
 public record TenantOwnerLogin(string FirstName, string? LastName, string Email, string Password);

@@ -32,6 +32,10 @@ public class PlatformUser
     [MaxLength(200)]
     public string Email { get; set; } = string.Empty;
 
+    /// <summary>Optional, unique across platform users. Column added at API startup when missing (Program.cs).</summary>
+    [MaxLength(30)]
+    public string? Mobile { get; set; }
+
     [MaxLength(500)]
     public string? PasswordHash { get; set; }
 

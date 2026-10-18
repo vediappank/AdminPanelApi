@@ -15,7 +15,7 @@
     usp_TenantUsers_CheckSync      lists differences between TenantUsers and the tenant databases
 
   Uses the existing tables: dbo.Tenants (IsActive), dbo.TenantDatabases (DatabaseName, IsEnabled,
-  ProvisioningStep) and dbo.Licenses (IsActive, StartDate, ExpiryDate, UserLimit).
+  ProvisioningStep, DatabaseMode, DbUser, DbPassword) and dbo.Licenses (IsActive, StartDate, ExpiryDate, UserLimit).
   Nothing existing is changed except dbo.TenantUsers (unique e-mail, index, defaults).
 
   At the end: GRANT EXECUTE for the SQL login the Business Panel API uses (edit the name).
@@ -63,6 +63,13 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id = OBJECT_ID(N'dbo.Tenan
     CREATE INDEX IX_TenantUsers_TenantId ON dbo.TenantUsers (TenantId);
 GO
 
+/* ------------------------------------------------------------------ 1b. database's own SQL user (Manual mode, e.g. Plesk)
+   Also added by the Admin Panel API on start-up; here too so this script can run first. */
+IF COL_LENGTH(N'dbo.TenantDatabases', N'DatabaseMode') IS NULL ALTER TABLE dbo.TenantDatabases ADD DatabaseMode NVARCHAR(10) NOT NULL CONSTRAINT DF_TenantDatabases_DatabaseMode DEFAULT (N'Automatic');
+IF COL_LENGTH(N'dbo.TenantDatabases', N'DbUser') IS NULL ALTER TABLE dbo.TenantDatabases ADD DbUser NVARCHAR(128) NULL;
+IF COL_LENGTH(N'dbo.TenantDatabases', N'DbPassword') IS NULL ALTER TABLE dbo.TenantDatabases ADD DbPassword NVARCHAR(500) NULL;
+GO
+
 /* ------------------------------------------------------------------ 2. one view of a tenant's login state */
 CREATE OR ALTER VIEW dbo.vw_TenantLogin
 AS
@@ -80,7 +87,11 @@ SELECT
     ISNULL(l.LicenseCount, 0)                    AS LicenseCount,
     lv.ExpiryDate                                AS LicenseValidUntil,
     ISNULL(lv.UserLimit, 0)                      AS UserLimit,
-    (SELECT COUNT(*) FROM dbo.TenantUsers u WHERE u.TenantId = t.TenantId) AS UserCount
+    (SELECT COUNT(*) FROM dbo.TenantUsers u WHERE u.TenantId = t.TenantId) AS UserCount,
+    -- Manual databases with their own SQL user: the Business Panel opens the database with this user.
+    -- DbPassword is encrypted (key: MultiTenant:CredentialKey = the Admin Panel's TenantDatabase:CredentialKey).
+    CASE WHEN d.DatabaseMode = N'Manual' THEN NULLIF(LTRIM(RTRIM(d.DbUser)), N'') END AS DbUser,
+    CASE WHEN d.DatabaseMode = N'Manual' AND NULLIF(LTRIM(RTRIM(d.DbUser)), N'') IS NOT NULL THEN d.DbPassword END AS DbPassword
 FROM dbo.Tenants t
 LEFT JOIN dbo.TenantDatabases d ON d.TenantId = t.TenantId
 OUTER APPLY (SELECT COUNT(*) AS LicenseCount FROM dbo.Licenses x WHERE x.TenantId = t.TenantId) l

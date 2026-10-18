@@ -52,6 +52,40 @@ public class ProvisionTenantDto
     /// and locked as converted - see PlatformTenantProvisioningService.
     /// </summary>
     public int? LeadId { get; set; }
+
+    /// <summary>
+    /// How the tenant's own database is created: "Automatic" (the API creates it - needs CREATE DATABASE
+    /// permission for its SQL login) or "Manual" (you create it first, e.g. in Plesk, then provisioning
+    /// fills it). Null = TenantDatabase:DefaultMode.
+    /// </summary>
+    public string? DatabaseMode { get; set; }
+
+    /// <summary>Database name - required in practice for Manual (must match the database you created).
+    /// Null = prefix + tenant code, e.g. BP_ACME.</summary>
+    public string? DatabaseName { get; set; }
+
+    /// <summary>Manual only: the database's own SQL user (the user Plesk creates with the database). The Admin
+    /// Panel and the Business Panel then open the database with this user. Empty = the API's own login.</summary>
+    public string? DbUser { get; set; }
+
+    /// <summary>Password of DbUser - stored encrypted, never logged.</summary>
+    public string? DbPassword { get; set; }
+}
+
+/// <summary>
+/// GET api/platform/tenants/owner-email-check - can this e-mail be the owner login of a tenant?
+/// An e-mail opens exactly one company in the Business Panel (SuperAdminPanel.dbo.TenantUsers is unique
+/// on Email), so an e-mail that already belongs to another tenant is refused before anything is created.
+/// </summary>
+public class OwnerEmailCheckDto
+{
+    public bool Available { get; set; }
+    /// <summary>The tenant that already uses the e-mail (when not available).</summary>
+    public int? TenantId { get; set; }
+    public string? TenantCode { get; set; }
+    public string? TenantName { get; set; }
+    /// <summary>Ready to show under the e-mail field.</summary>
+    public string? Message { get; set; }
 }
 
 public class ProvisionTenantResultDto

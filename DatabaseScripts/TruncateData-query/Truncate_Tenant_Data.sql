@@ -1,3 +1,4 @@
+use SuperAdminPanel;
 /*
   ============================================================================
   Start fresh: clear ALL tenant data and ALL sales workflow data

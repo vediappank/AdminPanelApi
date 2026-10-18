@@ -18,6 +18,8 @@ namespace RenewalTracker.PlatformApi.Controllers;
 ///   POST api/platform/tenants/{id}/database/migrate | seed | backup
 ///   GET  api/platform/tenants/{id}/database/progress   (tables, master data and scripts: done / not done)
 ///   POST api/platform/tenants/{id}/database/verify     (operator confirms - provisioning complete)
+///   PUT  api/platform/tenants/{id}/database/options    { databaseMode, databaseName, dbUser, dbPassword, runNow }  (Automatic / Manual)
+///   GET  api/platform/tenants/database-defaults?tenantCode=   (Provision tenant form: default mode, suggested name, SQL login)
 /// </summary>
 [ApiController]
 [Route("api/platform/tenants/{tenantId:int}")]
@@ -39,6 +41,19 @@ public class PlatformTenantControlController : ControllerBase
     {
         public int TenantId { get; set; }
         public string? DatabaseName { get; set; }
+        /// <summary>"Automatic" (the API creates the database) or "Manual" (created by you, e.g. in Plesk).</summary>
+        public string? DatabaseMode { get; set; }
+        /// <summary>True while the database step is not done yet - mode and name can still be changed.</summary>
+        public bool CanChangeDatabase { get; set; }
+        /// <summary>The SQL login the API uses - in Manual mode it must own the database you create, unless the
+        /// database's own user is entered (DbUser).</summary>
+        public string? SqlLogin { get; set; }
+        /// <summary>Manual mode: the database's own SQL user (e.g. created by Plesk) the apps open it with. Null = SqlLogin.</summary>
+        public string? DbUser { get; set; }
+        /// <summary>A password is saved for DbUser (the password itself is never sent back).</summary>
+        public bool HasDbPassword { get; set; }
+        /// <summary>TenantDatabase:CredentialKey is set - a database user's password can be saved.</summary>
+        public bool CanStoreDbPassword { get; set; }
         public string? ServerName { get; set; }
         public string? SchemaVersion { get; set; }
         public string? SeedVersion { get; set; }
@@ -67,6 +82,18 @@ public class PlatformTenantControlController : ControllerBase
     public class SetEnabledRequest
     {
         public bool Enabled { get; set; }
+    }
+
+    public class SetDatabaseOptionsRequest
+    {
+        public string? DatabaseMode { get; set; }
+        public string? DatabaseName { get; set; }
+        /// <summary>Manual: the database's own SQL user. Null = keep, "" = none (use the API's login).</summary>
+        public string? DbUser { get; set; }
+        /// <summary>Its password - empty = keep the saved one (same user). Stored encrypted.</summary>
+        public string? DbPassword { get; set; }
+        /// <summary>True = start provisioning straight away with the new choice (Run again).</summary>
+        public bool RunNow { get; set; }
     }
 
     public class DatabaseActionResult
@@ -100,6 +127,16 @@ public class PlatformTenantControlController : ControllerBase
         await _db.SaveChangesAsync();
         return Ok(await LoadAsync(tenantId));
     }
+
+    [HttpGet("~/api/platform/tenants/database-defaults")]
+    public async Task<ActionResult<TenantDatabaseDefaults>> Defaults([FromQuery] string? tenantCode, CancellationToken ct)
+        => Ok(await _databases.GetDatabaseDefaultsAsync(tenantCode, ct));
+
+    /// <summary>Automatic / Manual and the database name - only before the database step is done.</summary>
+    [HttpPut("database/options")]
+    public async Task<ActionResult<DatabaseActionResult>> SetDatabaseOptions(int tenantId, SetDatabaseOptionsRequest request, CancellationToken ct)
+        => await RunAsync(tenantId, () => _databases.SetDatabaseOptionsAsync(
+            tenantId, new TenantDatabaseOptions(request.DatabaseMode, request.DatabaseName, request.DbUser, request.DbPassword), request.RunNow, ct));
 
     [HttpGet("database/progress")]
     public async Task<ActionResult<TenantDatabaseProgress>> Progress(int tenantId, CancellationToken ct)
@@ -149,10 +186,17 @@ public class PlatformTenantControlController : ControllerBase
         {
             // dbo.TenantDatabases not created yet - the background worker creates it on its first run.
         }
+        var defaults = await _databases.GetDatabaseDefaultsAsync(tenant.TenantCode);
         return new TenantControlDto
         {
             TenantId = tenantId,
-            DatabaseName = reg?.DatabaseName,
+            DatabaseName = reg?.DatabaseName ?? defaults.SuggestedDatabaseName,
+            DatabaseMode = reg?.DatabaseMode ?? defaults.DefaultMode,
+            CanChangeDatabase = defaults.Enabled && (reg == null || (reg.ProvisioningStep <= TenantDatabaseService.StepDatabase && reg.Status != "Running")),
+            SqlLogin = defaults.SqlLogin,
+            DbUser = reg?.DatabaseMode == TenantDatabaseModes.Manual ? reg.DbUser : null,
+            HasDbPassword = reg?.DatabaseMode == TenantDatabaseModes.Manual && !string.IsNullOrEmpty(reg.DbPassword),
+            CanStoreDbPassword = defaults.CanStoreDbPassword,
             ServerName = reg?.ServerName,
             SchemaVersion = reg?.SchemaVersion,
             SeedVersion = reg?.SeedVersion,

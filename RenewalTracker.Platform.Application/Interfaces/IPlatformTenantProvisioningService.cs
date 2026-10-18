@@ -35,4 +35,12 @@ public interface IPlatformTenantProvisioningService
     Task<ProvisionTenantResultDto> ProvisionAsync(ProvisionTenantDto dto);
 
     Task<ProvisionTenantResultDto> CompleteProvisioningAsync(int tenantId, ProvisionTenantDto dto);
+
+    /// <summary>
+    /// Is <paramref name="email"/> free to be the owner login of a tenant? Not free when another tenant
+    /// already has it - in the Business Panel login directory (dbo.TenantUsers) or as the owner of its
+    /// database (dbo.TenantDatabases.OwnerEmail). <paramref name="forTenantId"/> = the tenant being
+    /// completed (its own e-mail is fine); null for a new tenant.
+    /// </summary>
+    Task<OwnerEmailCheckDto> CheckOwnerEmailAsync(string? email, int? forTenantId, CancellationToken ct = default);
 }

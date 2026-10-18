@@ -49,8 +49,15 @@ public class PlatformTenantProvisioningService : IPlatformTenantProvisioningServ
         if (string.IsNullOrWhiteSpace(dto.AdminEmail)) throw new InvalidOperationException("Admin email is required.");
         if (string.IsNullOrWhiteSpace(dto.AdminPassword)) throw new InvalidOperationException("Admin password is required.");
 
+        // Before anything is created: the owner e-mail must not be another tenant's login.
+        await EnsureOwnerEmailAvailableAsync(dto.AdminEmail, forTenantId: null);
+
         var codeTaken = await _db.Tenants.AnyAsync(t => t.TenantCode == tenantCode);
         if (codeTaken) throw new InvalidOperationException($"Tenant code '{tenantCode}' is already in use.");
+
+        // Database mode / name (Automatic or Manual) - checked before the tenant is created.
+        var databaseError = await _tenantDatabases.ValidateDatabaseOptionsAsync(DatabaseOf(dto), forTenantId: null);
+        if (databaseError != null) throw new InvalidOperationException(databaseError);
 
         await EnsureLeadNotAlreadyConvertedAsync(dto.LeadId);
 
@@ -88,7 +95,7 @@ public class PlatformTenantProvisioningService : IPlatformTenantProvisioningServ
         // login added - by the background worker, starting now. This call returns at once; the
         // Control Center shows the progress live. A failure is stored on dbo.TenantDatabases and
         // retried automatically - it does not undo the tenant.
-        await _tenantDatabases.QueueProvisioningAsync(tenant.TenantId, OwnerOf(dto), SettingsOf(dto));
+        await _tenantDatabases.QueueProvisioningAsync(tenant.TenantId, OwnerOf(dto), SettingsOf(dto), DatabaseOf(dto));
 
         if (_skipBusinessApiCall)
         {
@@ -104,9 +111,15 @@ public class PlatformTenantProvisioningService : IPlatformTenantProvisioningServ
     {
         var tenant = await _db.Tenants.FirstOrDefaultAsync(t => t.TenantId == tenantId);
         if (tenant == null) throw new InvalidOperationException($"Tenant {tenantId} was not found.");
+        if (string.IsNullOrWhiteSpace(dto.AdminEmail)) throw new InvalidOperationException("Admin email is required.");
+
+        // Before anything is changed: the owner e-mail must not be another tenant's login.
+        await EnsureOwnerEmailAvailableAsync(dto.AdminEmail, forTenantId: tenant.TenantId);
+        var databaseError = await _tenantDatabases.ValidateDatabaseOptionsAsync(DatabaseOf(dto), forTenantId: tenant.TenantId);
+        if (databaseError != null) throw new InvalidOperationException(databaseError);
 
         await SaveMenuAssignmentsAsync(tenant.TenantId, dto);
-        await _tenantDatabases.QueueProvisioningAsync(tenant.TenantId, OwnerOf(dto), SettingsOf(dto));
+        await _tenantDatabases.QueueProvisioningAsync(tenant.TenantId, OwnerOf(dto), SettingsOf(dto), DatabaseOf(dto));
 
         if (_skipBusinessApiCall)
         {
@@ -167,6 +180,82 @@ public class PlatformTenantProvisioningService : IPlatformTenantProvisioningServ
     /// creation - no-ops when leadId is null (an ordinary Tenants ▸ +
     /// Provision tenant, not a Convert to Tenant from the Leads screen).
     /// </summary>
+    // ------------------------------------------------------------------ owner e-mail: one tenant per e-mail
+
+    private async Task EnsureOwnerEmailAvailableAsync(string email, int? forTenantId)
+    {
+        var check = await CheckOwnerEmailAsync(email, forTenantId);
+        if (!check.Available) throw new InvalidOperationException(check.Message ?? "This e-mail cannot be used.");
+    }
+
+    public async Task<OwnerEmailCheckDto> CheckOwnerEmailAsync(string? email, int? forTenantId, CancellationToken ct = default)
+    {
+        var e = (email ?? string.Empty).Trim().ToLowerInvariant();
+        if (e.Length == 0) return new OwnerEmailCheckDto { Available = false, Message = "Admin email is required." };
+
+        // dbo.TenantUsers = the Business Panel login directory (one row per e-mail);
+        // dbo.TenantDatabases.OwnerEmail = owners still being provisioned (not in the directory yet).
+        // Both may be missing on an older database - checked before use.
+        const string sql = @"
+SET NOCOUNT ON;
+DECLARE @hits TABLE (TenantId INT NOT NULL);
+IF OBJECT_ID(N'dbo.TenantUsers', N'U') IS NOT NULL
+    INSERT @hits (TenantId) SELECT TenantId FROM dbo.TenantUsers WHERE Email = @e;
+IF OBJECT_ID(N'dbo.TenantDatabases', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.TenantDatabases', N'OwnerEmail') IS NOT NULL
+    INSERT @hits (TenantId)
+    EXEC sys.sp_executesql N'SELECT TenantId FROM dbo.TenantDatabases WHERE LOWER(LTRIM(RTRIM(OwnerEmail))) = @e', N'@e NVARCHAR(200)', @e = @e;
+SELECT TOP (1) t.TenantId, t.TenantCode, t.TenantName
+FROM @hits h
+JOIN dbo.Tenants t ON t.TenantId = h.TenantId
+WHERE @forTenantId IS NULL OR h.TenantId <> @forTenantId
+ORDER BY t.TenantId;";
+
+        var conn = _db.Database.GetDbConnection();
+        var opened = false;
+        if (conn.State != System.Data.ConnectionState.Open) { await conn.OpenAsync(ct); opened = true; }
+        try
+        {
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = sql;
+            var tx = _db.Database.CurrentTransaction;
+            if (tx != null) cmd.Transaction = Microsoft.EntityFrameworkCore.Storage.DbContextTransactionExtensions.GetDbTransaction(tx);
+
+            var pEmail = cmd.CreateParameter();
+            pEmail.ParameterName = "@e"; pEmail.DbType = System.Data.DbType.String; pEmail.Size = 200; pEmail.Value = e;
+            cmd.Parameters.Add(pEmail);
+            var pTenant = cmd.CreateParameter();
+            pTenant.ParameterName = "@forTenantId"; pTenant.DbType = System.Data.DbType.Int32; pTenant.Value = (object?)forTenantId ?? DBNull.Value;
+            cmd.Parameters.Add(pTenant);
+
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            if (!await r.ReadAsync(ct))
+            {
+                await r.CloseAsync();
+                // one e-mail = one login: an Admin Panel (platform operator) login cannot also be a tenant owner
+                var isOperator = await _db.PlatformUsers.AsNoTracking().AnyAsync(u => u.Email.Trim().ToLower() == e, ct);
+                return isOperator
+                    ? new OwnerEmailCheckDto { Available = false, Message = "Already an Admin Panel login. Use a different e-mail." }
+                    : new OwnerEmailCheckDto { Available = true };
+            }
+
+            var tenantId = r.GetInt32(0);
+            var code = r.IsDBNull(1) ? string.Empty : r.GetString(1);
+            var name = r.IsDBNull(2) ? string.Empty : r.GetString(2);
+            return new OwnerEmailCheckDto
+            {
+                Available = false,
+                TenantId = tenantId,
+                TenantCode = code,
+                TenantName = name,
+                Message = $"Already the owner login of {name} ({code}). Use a different e-mail.",
+            };
+        }
+        finally
+        {
+            if (opened) await conn.CloseAsync();
+        }
+    }
+
     private async Task EnsureLeadNotAlreadyConvertedAsync(int? leadId)
     {
         if (leadId is not int id) return;
@@ -240,6 +329,12 @@ public class PlatformTenantProvisioningService : IPlatformTenantProvisioningServ
     /// mistaken for a fully working tenant later.
     /// </summary>
     private static TenantSettings SettingsOf(ProvisionTenantDto dto) => new(dto.DateFormat, dto.TimeZone, dto.Currency);
+
+    private static TenantDatabaseOptions? DatabaseOf(ProvisionTenantDto dto) =>
+        string.IsNullOrWhiteSpace(dto.DatabaseMode) && string.IsNullOrWhiteSpace(dto.DatabaseName) && string.IsNullOrWhiteSpace(dto.DbUser)
+            ? null
+            : new TenantDatabaseOptions(dto.DatabaseMode, dto.DatabaseName,
+                string.IsNullOrWhiteSpace(dto.DbUser) ? null : dto.DbUser, string.IsNullOrEmpty(dto.DbPassword) ? null : dto.DbPassword);
 
     private static TenantOwnerLogin? OwnerOf(ProvisionTenantDto dto) =>
         string.IsNullOrWhiteSpace(dto.AdminEmail) || string.IsNullOrEmpty(dto.AdminPassword)

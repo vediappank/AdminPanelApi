@@ -30,7 +30,7 @@ public class RequestResponseLoggingMiddleware
     // never reaches the log file, whichever endpoint it came from.
     private static readonly string[] SensitiveFields =
     {
-        "password", "initialpassword", "newpassword", "currentpassword", "token", "accessToken", "key", "secret",
+        "password", "initialpassword", "newpassword", "currentpassword", "dbpassword", "token", "accessToken", "key", "secret",
     };
 
     private readonly RequestDelegate _next;
