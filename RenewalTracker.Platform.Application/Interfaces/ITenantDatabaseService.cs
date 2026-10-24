@@ -54,6 +54,22 @@ public interface ITenantDatabaseService
     /// <summary>Start / finish time of each provisioning step (dbo.TenantProvisioningSteps).</summary>
     Task<List<TenantProvisioningStepInfo>> GetStepsAsync(int tenantId, CancellationToken ct = default);
 
+    /// <summary>The company name and logo the Business Panel shows after this tenant's users log in
+    /// (tenant database dbo.ApplicationSettings "Tenant.Name" / "Tenant.Logo").</summary>
+    Task<TenantBranding> GetBrandingAsync(int tenantId, CancellationToken ct = default);
+
+    /// <summary>Saves the name (empty = the tenant's name) and logo (data URL; empty = no logo, the Bliss Point logo is shown),
+    /// and the PDF template of each document (classic / modern / elegant / minimal; null = keep).</summary>
+    Task<TenantDatabaseRunResult> SetBrandingAsync(int tenantId, string? companyName, string? logoDataUrl, CancellationToken ct = default,
+        string? quotationTemplate = null, string? invoiceTemplate = null, string? receiptTemplate = null);
+
+    /// <summary>Company name / logo of every tenant for the Tenants list - from the SuperAdminPanel copy
+    /// (dbo.TenantBrandingCache, refreshed whenever branding is read or saved; tenants never seen are read once).</summary>
+    Task<List<TenantBrandingSummary>> GetBrandingSummaryAsync(CancellationToken ct = default);
+
+    /// <summary>One tenant's logo bytes from the SuperAdminPanel copy, or null.</summary>
+    Task<(byte[] Bytes, string ContentType, DateTime UpdatedAt)?> GetCachedLogoAsync(int tenantId, CancellationToken ct = default);
+
     /// <summary>Read-only: what the tenant database should have (from the scripts and the template list)
     /// against what it actually has - for the Control Center "Provisioning details" screen.</summary>
     Task<TenantDatabaseProgress?> GetProgressAsync(int tenantId, CancellationToken ct = default);
@@ -90,6 +106,14 @@ public record TenantDatabaseOptions(string? Mode, string? DatabaseName, string? 
 /// in Manual mode either that login owns the database you create, or you enter the database's own user.
 /// CanStoreDbPassword = TenantDatabase:CredentialKey is set (needed to save a database user's password).</summary>
 public record TenantDatabaseDefaults(string DefaultMode, string SuggestedDatabaseName, string Prefix, string? SqlLogin, bool Enabled, bool CanStoreDbPassword);
+
+/// <summary>Business Panel branding of one tenant. Available = false while its database has no settings table yet
+/// (Message says why); DefaultName = the tenant's name, used when no company name is set.</summary>
+public record TenantBranding(bool Available, string? Message, string? CompanyName, string? LogoDataUrl, string DefaultName,
+    string QuotationTemplate = "classic", string InvoiceTemplate = "classic", string ReceiptTemplate = "classic");
+
+/// <summary>Tenants list: the company name the Business Panel shows and whether a logo is set (GET .../{id}/logo serves it).</summary>
+public record TenantBrandingSummary(int TenantId, string? CompanyName, bool HasLogo, DateTime? UpdatedAt);
 
 /// <summary>The tenant's first admin (owner) login entered on Provision tenant.</summary>
 public record TenantOwnerLogin(string FirstName, string? LastName, string Email, string Password);

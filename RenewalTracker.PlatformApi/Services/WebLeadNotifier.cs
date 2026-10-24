@@ -84,7 +84,7 @@ public class WebLeadNotifier
             customerParameters: new[] { FirstName(r.FullName), r.ReferenceNo });
     }
 
-    public async Task JobApplicationReceivedAsync(WebJobApplicationInsertResult r)
+    public async Task JobApplicationReceivedAsync(WebJobApplicationInsertResult r, byte[]? cv = null, string? cvFileName = null, string? cvContentType = null)
     {
         if (r.IsSpam) return;
 
@@ -104,13 +104,16 @@ public class WebLeadNotifier
 
         QueueEmail(_config["Website:CareersNotifyEmail"],
             $"New CV {r.ReferenceNo} - {r.FullName} ({r.RoleApplied})",
-            "A new job application was received from the careers page. Open Admin Panel ▸ Website Leads ▸ Job Applications to download the CV.",
+            cv is { Length: > 0 }
+                ? "A new job application was received from the careers page. The CV is attached to this email (also available in Admin Panel ▸ Website Leads ▸ Job Applications)."
+                : "A new job application was received from the careers page. Open Admin Panel ▸ Website Leads ▸ Job Applications to download the CV.",
             new List<(string, string)>
             {
                 ("Reference", r.ReferenceNo), ("Name", r.FullName), ("Email", r.Email), ("Phone", r.Phone),
                 ("Role", r.RoleApplied), ("Experience", r.Experience ?? ""),
             },
-            replyTo: r.Email);
+            replyTo: r.Email,
+            attachment: cv is { Length: > 0 } ? (cv!, cvFileName ?? "cv", cvContentType ?? "application/octet-stream") : null);
 
         // Staff alert only - applicants are not messaged on WhatsApp.
         QueueWhatsApp(r.ReferenceNo,
@@ -146,7 +149,8 @@ public class WebLeadNotifier
     }
 
     /// <summary>Department email. Returns the first recipient (used as Reply-To on the visitor's acknowledgement).</summary>
-    private string? QueueEmail(string? formNotifyEmail, string subject, string body, List<(string, string)> details, string? replyTo)
+    private string? QueueEmail(string? formNotifyEmail, string subject, string body, List<(string, string)> details, string? replyTo,
+        (byte[] Data, string FileName, string ContentType)? attachment = null)
     {
         var recipients = ParseRecipients(formNotifyEmail);
         if (recipients.Count == 0) recipients = ParseRecipients(_config["Website:NotifyEmail"]);
@@ -164,7 +168,10 @@ public class WebLeadNotifier
 
         RunInBackground($"department email '{subject}'", async ct =>
         {
-            await SmtpMail.SendHtmlAsync(smtp, recipients, subject, html, safeReplyTo, ct);
+            if (attachment is { } a)
+                await SmtpMail.SendHtmlWithAttachmentAsync(smtp, recipients, subject, html, safeReplyTo, a.Data, a.FileName, a.ContentType, ct);
+            else
+                await SmtpMail.SendHtmlAsync(smtp, recipients, subject, html, safeReplyTo, ct);
             _logger.LogInformation("WebLeadNotifier: department email sent to {To} for '{Subject}'", string.Join(", ", recipients), subject);
         });
         return recipients[0];
@@ -229,6 +236,7 @@ public class WebLeadNotifier
         var phone = _config["Website:ContactPhone"] ?? "+971 4 454 0091";
         var whatsApp = new string((_config["Website:WhatsAppNumber"] ?? "971589970732").Where(char.IsDigit).ToArray());
         var site = (_config["Website:PublicUrl"] ?? "https://blisspointworld.com").TrimEnd('/');
+        var logo = _config["Website:EmailLogoUrl"] ?? site + "/images/brand/blisspoint-logo.png";
         var interest = string.IsNullOrWhiteSpace(r.ServiceInterest) ? r.FormName : r.ServiceInterest;
         var waText = Uri.EscapeDataString($"Hello Bliss Point Group, my enquiry reference is {r.ReferenceNo}.");
 
@@ -246,6 +254,7 @@ public class WebLeadNotifier
 or <a href=""https://wa.me/{E(whatsApp)}?text={waText}"" style=""color:#005670"">message us on WhatsApp</a> and quote your reference.</p>
 <p style=""margin-top:24px"">Kind regards,<br><b>{E(SmtpMail.CompanyName)}</b><br>
 <span style=""color:#5d6b7e;font-size:13px"">Balooshi Building, Meena Bazar, Bur Dubai, Dubai - UAE<br><a href=""{E(site)}"" style=""color:#005670"">{E(site.Replace("https://", ""))}</a></span></p>
+<p style=""margin:14px 0 0""><a href=""{E(site)}"" target=""_blank"" style=""display:inline-block;text-decoration:none""><img src=""{E(logo)}"" alt=""{E(SmtpMail.CompanyName)}"" width=""150"" style=""display:block;width:150px;max-width:150px;height:auto;border:0""></a></p>
 </div>
 <p style=""color:#8a96a3;font-size:12px;margin-top:12px"">You are receiving this email because you submitted a form on {E(site.Replace("https://", ""))}. If this wasn't you, please ignore it.</p>
 </div>";

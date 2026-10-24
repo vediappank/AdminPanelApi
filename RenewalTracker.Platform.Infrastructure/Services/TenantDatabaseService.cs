@@ -492,6 +492,213 @@ public class TenantDatabaseService : ITenantDatabaseService
         return new(true, "Provisioning verified and complete.");
     }
 
+    // ------------------------------------------------------------------ Business Panel branding
+
+    private const string BrandingNameKey = "Tenant.Name", BrandingLogoKey = "Tenant.Logo";
+    private const string TemplateQuotationKey = "Tenant.Template.Quotation", TemplateInvoiceKey = "Tenant.Template.Invoice", TemplateReceiptKey = "Tenant.Template.Receipt";
+    private static readonly string[] DocumentTemplateCodes = { "classic", "modern", "elegant", "minimal" };
+
+    private static string TemplateOrDefault(string? value)
+    {
+        var v = (value ?? string.Empty).Trim().ToLowerInvariant();
+        return DocumentTemplateCodes.Contains(v) ? v : "classic";
+    }
+
+    public async Task<TenantBranding> GetBrandingAsync(int tenantId, CancellationToken ct = default)
+    {
+        var tenant = await _db.Tenants.AsNoTracking().FirstOrDefaultAsync(t => t.TenantId == tenantId, ct);
+        if (tenant == null) return new TenantBranding(false, "Tenant not found.", null, null, string.Empty);
+        var (reg, unavailable) = await BrandingDatabaseAsync(tenantId, ct);
+        if (reg == null) return new TenantBranding(false, unavailable, null, null, tenant.TenantName);
+        try
+        {
+            var values = await ReadBrandingSettingsAsync(reg, ct);
+            var name = values.GetValueOrDefault(BrandingNameKey);
+            var logo = values.GetValueOrDefault(BrandingLogoKey);
+            await CacheBrandingAsync(tenantId, name, logo, ct);
+            return new TenantBranding(true, null, name, logo, tenant.TenantName,
+                TemplateOrDefault(values.GetValueOrDefault(TemplateQuotationKey)),
+                TemplateOrDefault(values.GetValueOrDefault(TemplateInvoiceKey)),
+                TemplateOrDefault(values.GetValueOrDefault(TemplateReceiptKey)));
+        }
+        catch (Exception ex) when (ex is SqlException or InvalidOperationException)
+        {
+            _logger.LogWarning(ex, "Branding of tenant {TenantId} could not be read", tenantId);
+            return new TenantBranding(false, $"{reg.DatabaseName} cannot be opened: {ex.Message}", null, null, tenant.TenantName);
+        }
+    }
+
+    private async Task<Dictionary<string, string?>> ReadBrandingSettingsAsync(TenantDatabase reg, CancellationToken ct)
+    {
+        await using var conn = new SqlConnection(TenantConnection(reg));
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(
+            "SELECT SettingKey, SettingValue FROM dbo.ApplicationSettings WHERE SettingKey IN (@name, @logo, @tq, @ti, @tr) AND IsActive = 1;", conn);
+        cmd.Parameters.AddWithValue("@name", BrandingNameKey);
+        cmd.Parameters.AddWithValue("@logo", BrandingLogoKey);
+        cmd.Parameters.AddWithValue("@tq", TemplateQuotationKey);
+        cmd.Parameters.AddWithValue("@ti", TemplateInvoiceKey);
+        cmd.Parameters.AddWithValue("@tr", TemplateReceiptKey);
+        var values = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        while (await r.ReadAsync(ct))
+            values[r.GetString(0)] = r.IsDBNull(1) ? null : r.GetString(1);
+        return values;
+    }
+
+    public async Task<TenantDatabaseRunResult> SetBrandingAsync(int tenantId, string? companyName, string? logoDataUrl, CancellationToken ct = default,
+        string? quotationTemplate = null, string? invoiceTemplate = null, string? receiptTemplate = null)
+    {
+        var tenant = await _db.Tenants.AsNoTracking().FirstOrDefaultAsync(t => t.TenantId == tenantId, ct);
+        if (tenant == null) return new(false, "Tenant not found.");
+        if (BrandingLogo.NameError(companyName) is string nameError) return new(false, nameError);
+        if (BrandingLogo.Error(logoDataUrl) is string logoError) return new(false, logoError);
+        foreach (var tpl in new[] { quotationTemplate, invoiceTemplate, receiptTemplate })
+            if (!string.IsNullOrWhiteSpace(tpl) && !DocumentTemplateCodes.Contains(tpl.Trim().ToLowerInvariant()))
+                return new(false, "Template must be Classic, Modern, Elegant or Minimal.");
+        var (reg, unavailable) = await BrandingDatabaseAsync(tenantId, ct);
+        if (reg == null) return new(false, unavailable ?? "This tenant has no database yet.");
+
+        var name = BrandingLogo.CleanName(companyName) ?? tenant.TenantName;   // Business Panel always shows a company name
+        var logo = BrandingLogo.CleanLogo(logoDataUrl);
+        try
+        {
+            await using var conn = new SqlConnection(TenantConnection(reg));
+            await conn.OpenAsync(ct);
+            await UpsertSettingAsync(conn, BrandingNameKey, name, ct);
+            await UpsertSettingAsync(conn, BrandingLogoKey, logo, ct);
+            if (!string.IsNullOrWhiteSpace(quotationTemplate)) await UpsertSettingAsync(conn, TemplateQuotationKey, TemplateOrDefault(quotationTemplate), ct);
+            if (!string.IsNullOrWhiteSpace(invoiceTemplate)) await UpsertSettingAsync(conn, TemplateInvoiceKey, TemplateOrDefault(invoiceTemplate), ct);
+            if (!string.IsNullOrWhiteSpace(receiptTemplate)) await UpsertSettingAsync(conn, TemplateReceiptKey, TemplateOrDefault(receiptTemplate), ct);
+            await CacheBrandingAsync(tenantId, name, logo, ct);
+            return new(true, logo == null
+                ? $"Saved - the Business Panel shows \"{name}\" with the Bliss Point logo."
+                : $"Saved - the Business Panel shows \"{name}\" with this logo. Users see it after their next sign-in or page refresh.");
+        }
+        catch (Exception ex) when (ex is SqlException or InvalidOperationException)
+        {
+            _logger.LogWarning(ex, "Branding of tenant {TenantId} could not be saved", tenantId);
+            return new(false, $"Could not save in {reg.DatabaseName}: {ex.Message}");
+        }
+    }
+
+    /// <summary>Insert / update one tenant setting; a null value removes it.</summary>
+    private static async Task UpsertSettingAsync(SqlConnection conn, string key, string? value, CancellationToken ct)
+    {
+        await using var cmd = new SqlCommand(@"
+IF @value IS NULL
+    DELETE dbo.ApplicationSettings WHERE SettingKey = @key;
+ELSE
+    MERGE dbo.ApplicationSettings AS t
+    USING (SELECT @key AS SettingKey, @value AS SettingValue) AS s ON t.SettingKey = s.SettingKey
+    WHEN MATCHED THEN UPDATE SET SettingValue = s.SettingValue, IsActive = 1, ModifiedDate = SYSUTCDATETIME()
+    WHEN NOT MATCHED THEN INSERT (SettingKey, SettingValue, IsActive, ModifiedDate) VALUES (s.SettingKey, s.SettingValue, 1, SYSUTCDATETIME());", conn);
+        cmd.Parameters.Add("@key", System.Data.SqlDbType.NVarChar, 100).Value = key;
+        cmd.Parameters.Add("@value", System.Data.SqlDbType.NVarChar, -1).Value = (object?)value ?? DBNull.Value;
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    // ---- SuperAdminPanel copy of each tenant's name + logo, for the Tenants list (no need to open every tenant database)
+
+    private const string BrandingCacheEnsureSql = @"
+IF OBJECT_ID(N'dbo.TenantBrandingCache', N'U') IS NULL
+CREATE TABLE dbo.TenantBrandingCache
+(
+    TenantId     INT            NOT NULL CONSTRAINT PK_TenantBrandingCache PRIMARY KEY,
+    CompanyName  NVARCHAR(150)  NULL,
+    LogoDataUrl  NVARCHAR(MAX)  NULL,
+    UpdatedAt    DATETIME2(0)   NOT NULL CONSTRAINT DF_TenantBrandingCache_UpdatedAt DEFAULT (SYSUTCDATETIME())
+);";
+
+    private async Task CacheBrandingAsync(int tenantId, string? name, string? logo, CancellationToken ct)
+    {
+        try
+        {
+            await using var conn = new SqlConnection(BaseConnectionString);
+            await conn.OpenAsync(ct);
+            await using var cmd = new SqlCommand(BrandingCacheEnsureSql + @"
+MERGE dbo.TenantBrandingCache AS t
+USING (SELECT @t AS TenantId) AS s ON t.TenantId = s.TenantId
+WHEN MATCHED AND (ISNULL(t.CompanyName, N'') <> ISNULL(@name, N'') OR ISNULL(t.LogoDataUrl, N'') <> ISNULL(@logo, N''))
+    THEN UPDATE SET CompanyName = @name, LogoDataUrl = @logo, UpdatedAt = SYSUTCDATETIME()
+WHEN NOT MATCHED THEN INSERT (TenantId, CompanyName, LogoDataUrl, UpdatedAt) VALUES (@t, @name, @logo, SYSUTCDATETIME());", conn);
+            cmd.Parameters.AddWithValue("@t", tenantId);
+            cmd.Parameters.Add("@name", System.Data.SqlDbType.NVarChar, 150).Value = (object?)name ?? DBNull.Value;
+            cmd.Parameters.Add("@logo", System.Data.SqlDbType.NVarChar, -1).Value = (object?)logo ?? DBNull.Value;
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+        catch (SqlException ex)
+        {
+            _logger.LogWarning(ex, "Branding copy of tenant {TenantId} could not be saved in SuperAdminPanel", tenantId);
+        }
+    }
+
+    public async Task<List<TenantBrandingSummary>> GetBrandingSummaryAsync(CancellationToken ct = default)
+    {
+        var list = new Dictionary<int, TenantBrandingSummary>();
+        await using (var conn = new SqlConnection(BaseConnectionString))
+        {
+            await conn.OpenAsync(ct);
+            await using var cmd = new SqlCommand(BrandingCacheEnsureSql +
+                " SELECT TenantId, CompanyName, CAST(CASE WHEN LogoDataUrl IS NULL THEN 0 ELSE 1 END AS BIT), UpdatedAt FROM dbo.TenantBrandingCache;", conn);
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct))
+                list[r.GetInt32(0)] = new TenantBrandingSummary(r.GetInt32(0), r.IsDBNull(1) ? null : r.GetString(1), r.GetBoolean(2), r.GetDateTime(3));
+        }
+
+        // tenants never seen yet (branding set before the copy existed): read their databases once
+        List<TenantDatabase> missing;
+        try
+        {
+            missing = await _db.TenantDatabases.AsNoTracking()
+                .Where(d => d.ProvisioningStep > StepSchema && d.IsEnabled)
+                .ToListAsync(ct);
+        }
+        catch (SqlException) { missing = new(); }
+        foreach (var reg in missing.Where(m => !list.ContainsKey(m.TenantId)).Take(25))
+        {
+            try
+            {
+                var values = await ReadBrandingSettingsAsync(reg, ct);
+                var name = values.GetValueOrDefault(BrandingNameKey);
+                var logo = values.GetValueOrDefault(BrandingLogoKey);
+                await CacheBrandingAsync(reg.TenantId, name, logo, ct);
+                list[reg.TenantId] = new TenantBrandingSummary(reg.TenantId, name, logo != null, DateTime.UtcNow);
+            }
+            catch (Exception ex) when (ex is SqlException or InvalidOperationException)
+            {
+                _logger.LogDebug(ex, "Branding of tenant {TenantId} skipped for the list", reg.TenantId);
+            }
+        }
+        return list.Values.OrderBy(v => v.TenantId).ToList();
+    }
+
+    public async Task<(byte[] Bytes, string ContentType, DateTime UpdatedAt)?> GetCachedLogoAsync(int tenantId, CancellationToken ct = default)
+    {
+        await using var conn = new SqlConnection(BaseConnectionString);
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(BrandingCacheEnsureSql + " SELECT LogoDataUrl, UpdatedAt FROM dbo.TenantBrandingCache WHERE TenantId = @t;", conn);
+        cmd.Parameters.AddWithValue("@t", tenantId);
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        if (!await r.ReadAsync(ct) || r.IsDBNull(0)) return null;
+        var match = System.Text.RegularExpressions.Regex.Match(r.GetString(0), @"^data:(?<type>image/[a-z0-9.+-]+);base64,(?<data>.+)$", System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Singleline);
+        if (!match.Success) return null;
+        try { return (Convert.FromBase64String(match.Groups["data"].Value.Trim()), match.Groups["type"].Value.ToLowerInvariant(), r.GetDateTime(1)); }
+        catch (FormatException) { return null; }
+    }
+
+    /// <summary>The tenant's registry row once its database has the settings table (schema step done), else why not.</summary>
+    private async Task<(TenantDatabase? Reg, string? Unavailable)> BrandingDatabaseAsync(int tenantId, CancellationToken ct)
+    {
+        TenantDatabase? reg;
+        try { reg = await _db.TenantDatabases.AsNoTracking().FirstOrDefaultAsync(r => r.TenantId == tenantId, ct); }
+        catch (SqlException) { reg = null; }
+        if (reg == null) return (null, "This tenant has no database yet - provision it first.");
+        if (reg.ProvisioningStep <= StepSchema)
+            return (null, $"Available once provisioning has built {reg.DatabaseName} (schema step).");
+        return (reg, null);
+    }
+
     public async Task<List<TenantProvisioningStepInfo>> GetStepsAsync(int tenantId, CancellationToken ct = default)
     {
         var list = new List<TenantProvisioningStepInfo>();
@@ -734,6 +941,7 @@ WHERE t.schema_id = 1 GROUP BY t.name;";
             // 2. Schema - each new script once, in order; a changed one is reported, never re-run.
             t0 = DateTime.UtcNow;
             var schema = await ApplyScriptsAsync(reg, "Schema", rerunChanged: false, forceAll: false, ct);
+            if (await CompatibilityWarningAsync(reg, ct) is string compatibility) schema.Warnings.Add(compatibility);
             applied.AddRange(schema.Applied);
             if (schema.Last != null) reg.SchemaVersion = schema.Last;
             await StepDoneAsync(reg, StepSchema, t0, schema.Applied.Count > 0 ? string.Join(", ", schema.Applied) : null, schema.Applied.Count > 0, ct);
@@ -819,6 +1027,20 @@ WHERE t.schema_id = 1 GROUP BY t.name;";
 
     private sealed record ScriptRun(List<string> Applied, string? Last, List<string> Warnings);
 
+    private static readonly Regex SequentialKeyOption = new(@",\s*OPTIMIZE_FOR_SEQUENTIAL_KEY\s*=\s*(?:ON|OFF)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    /// <summary>Major version of the connected SQL Server (13 = 2016, 14 = 2017, 15 = 2019, 16 = 2022).</summary>
+    private static int ServerMajorVersion(SqlConnection conn) =>
+        int.TryParse(conn.ServerVersion?.Split('.')[0], out var major) ? major : 99;
+
+    /// <summary>
+    /// Scripts scripted from a newer SQL Server (SSMS "Generate Scripts") carry index options older servers reject:
+    /// OPTIMIZE_FOR_SEQUENTIAL_KEY needs SQL Server 2019 (15) - removed before running on older servers.
+    /// Features with no safe automatic rewrite (e.g. STRING_AGG, 2017+) must be avoided in the scripts themselves.
+    /// </summary>
+    private static string ForServerVersion(string sql, int serverMajor) =>
+        serverMajor < 15 ? SequentialKeyOption.Replace(sql, string.Empty) : sql;
+
     private async Task<ScriptRun> ApplyScriptsAsync(TenantDatabase reg, string kind, bool rerunChanged, bool forceAll, CancellationToken ct)
     {
         var files = ScriptFiles(kind);
@@ -828,6 +1050,7 @@ WHERE t.schema_id = 1 GROUP BY t.name;";
 
         await using var conn = new SqlConnection(TenantConnection(reg));
         await conn.OpenAsync(ct);
+        var serverMajor = ServerMajorVersion(conn);
         var done = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         await using (var read = new SqlCommand("SELECT ScriptName, Checksum FROM dbo.SchemaVersions WHERE Kind = @kind", conn))
         {
@@ -855,7 +1078,8 @@ WHERE t.schema_id = 1 GROUP BY t.name;";
             await using var tx = (SqlTransaction)await conn.BeginTransactionAsync(ct);
             try
             {
-                foreach (var batch in GoSplitter.Split(sql).Select(b => b.Trim()).Where(b => b.Length > 0))
+                // The checksum is of the file as written; what runs is adapted to the server's version.
+                foreach (var batch in GoSplitter.Split(ForServerVersion(sql, serverMajor)).Select(b => b.Trim()).Where(b => b.Length > 0))
                 {
                     await using var cmd = new SqlCommand(batch, conn, tx) { CommandTimeout = 600 };
                     await cmd.ExecuteNonQueryAsync(ct);
@@ -1563,6 +1787,28 @@ SELECT ISNULL(HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE TABLE'), 0)
                   $"the Manual panel - or in Plesk add {LoginText} to it with full (db_owner) access - then click Run again."
                 : $"Manual database: {database} has not been created yet. In Plesk go to Databases > Add Database, use the exact name " +
                   $"{database} on this SQL server, enter its user and password on the Manual panel, then click Run again.", ex);
+        }
+    }
+
+    /// <summary>The procedures use STRING_SPLIT and the JSON functions, which need database compatibility level 130
+    /// (SQL Server 2016) or higher - a database made with a lower level gets a warning on the Control Center.</summary>
+    private async Task<string?> CompatibilityWarningAsync(TenantDatabase reg, CancellationToken ct)
+    {
+        try
+        {
+            await using var conn = new SqlConnection(TenantConnection(reg));
+            await conn.OpenAsync(ct);
+            await using var cmd = new SqlCommand("SELECT compatibility_level FROM sys.databases WHERE name = DB_NAME();", conn);
+            var level = Convert.ToInt32(await cmd.ExecuteScalarAsync(ct) ?? 0);
+            return level is > 0 and < 130
+                ? $"Database {reg.DatabaseName} has compatibility level {level} - it needs 130 or higher (STRING_SPLIT / JSON in the procedures). " +
+                  $"Ask the server administrator to run: ALTER DATABASE [{reg.DatabaseName}] SET COMPATIBILITY_LEVEL = 130;"
+                : null;
+        }
+        catch (SqlException ex)
+        {
+            _logger.LogWarning(ex, "Could not read the compatibility level of {Db}", reg.DatabaseName);
+            return null;
         }
     }
 

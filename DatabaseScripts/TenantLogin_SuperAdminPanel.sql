@@ -13,6 +13,9 @@
     usp_TenantUsers_Remove         Business Panel "delete user"
     usp_TenantUsers_SyncFromTenantDatabases   fills TenantUsers from every tenant database's dbo.Users (run once now, then any time)
     usp_TenantUsers_CheckSync      lists differences between TenantUsers and the tenant databases
+    dbo.TenantDevices              devices (browsers / phones) each company signs in from
+    usp_TenantDevices_Register     Business Panel login: records the device, refuses a new one over the plan's device limit
+                                   (a device not used for 30 days no longer counts; the Admin Panel can remove one)
 
   Uses the existing tables: dbo.Tenants (IsActive), dbo.TenantDatabases (DatabaseName, IsEnabled,
   ProvisioningStep, DatabaseMode, DbUser, DbPassword) and dbo.Licenses (IsActive, StartDate, ExpiryDate, UserLimit).
@@ -70,6 +73,25 @@ IF COL_LENGTH(N'dbo.TenantDatabases', N'DbUser') IS NULL ALTER TABLE dbo.TenantD
 IF COL_LENGTH(N'dbo.TenantDatabases', N'DbPassword') IS NULL ALTER TABLE dbo.TenantDatabases ADD DbPassword NVARCHAR(500) NULL;
 GO
 
+/* ------------------------------------------------------------------ 1c. devices each company signs in from (plan device limit) */
+IF OBJECT_ID(N'dbo.TenantDevices', N'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.TenantDevices
+    (
+        TenantDeviceId INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_TenantDevices PRIMARY KEY,
+        TenantId       INT            NOT NULL CONSTRAINT FK_TenantDevices_Tenants REFERENCES dbo.Tenants (TenantId) ON DELETE CASCADE,
+        DeviceId       NVARCHAR(64)   NOT NULL,
+        UserEmail      NVARCHAR(200)  NULL,
+        DeviceName     NVARCHAR(200)  NULL,
+        IpAddress      NVARCHAR(64)   NULL,
+        FirstSeenDate  DATETIME2(0)   NOT NULL CONSTRAINT DF_TenantDevices_First DEFAULT (SYSUTCDATETIME()),
+        LastSeenDate   DATETIME2(0)   NOT NULL CONSTRAINT DF_TenantDevices_Last DEFAULT (SYSUTCDATETIME()),
+        CONSTRAINT UX_TenantDevices_Device UNIQUE (TenantId, DeviceId)
+    );
+    PRINT N'Created dbo.TenantDevices';
+END;
+GO
+
 /* ------------------------------------------------------------------ 2. one view of a tenant's login state */
 CREATE OR ALTER VIEW dbo.vw_TenantLogin
 AS
@@ -88,6 +110,9 @@ SELECT
     lv.ExpiryDate                                AS LicenseValidUntil,
     ISNULL(lv.UserLimit, 0)                      AS UserLimit,
     (SELECT COUNT(*) FROM dbo.TenantUsers u WHERE u.TenantId = t.TenantId) AS UserCount,
+    ISNULL(lv.MaxDevices, 0)                     AS MaxDevices,
+    -- devices used in the last 30 days (see usp_TenantDevices_Register)
+    (SELECT COUNT(*) FROM dbo.TenantDevices dv WHERE dv.TenantId = t.TenantId AND dv.LastSeenDate >= DATEADD(DAY, -30, SYSUTCDATETIME())) AS DeviceCount,
     -- Manual databases with their own SQL user: the Business Panel opens the database with this user.
     -- DbPassword is encrypted (key: MultiTenant:CredentialKey = the Admin Panel's TenantDatabase:CredentialKey).
     CASE WHEN d.DatabaseMode = N'Manual' THEN NULLIF(LTRIM(RTRIM(d.DbUser)), N'') END AS DbUser,
@@ -97,7 +122,7 @@ LEFT JOIN dbo.TenantDatabases d ON d.TenantId = t.TenantId
 OUTER APPLY (SELECT COUNT(*) AS LicenseCount FROM dbo.Licenses x WHERE x.TenantId = t.TenantId) l
 OUTER APPLY (
     -- the active licence that runs longest and has started
-    SELECT TOP (1) x.ExpiryDate, x.UserLimit
+    SELECT TOP (1) x.ExpiryDate, x.UserLimit, x.MaxDevices
     FROM dbo.Licenses x
     WHERE x.TenantId = t.TenantId AND x.IsActive = 1 AND CONVERT(DATE, x.StartDate) <= CONVERT(DATE, GETDATE())
     ORDER BY x.ExpiryDate DESC
@@ -170,6 +195,50 @@ BEGIN
     END;
 
     INSERT dbo.TenantUsers (Email, TenantId) VALUES (@e, @TenantId);
+    COMMIT;
+END;
+GO
+
+/* Business Panel login: remember the device; a new device over the plan's MaxDevices is refused (50014).
+   0 = no limit. A device not used for @ActiveDays no longer counts and is replaced by the new one. */
+CREATE OR ALTER PROCEDURE dbo.usp_TenantDevices_Register
+    @TenantId   INT,
+    @DeviceId   NVARCHAR(64),
+    @Email      NVARCHAR(200) = NULL,
+    @DeviceName NVARCHAR(200) = NULL,
+    @IpAddress  NVARCHAR(64)  = NULL,
+    @ActiveDays INT           = 30
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    DECLARE @d NVARCHAR(64) = LTRIM(RTRIM(@DeviceId));
+    IF @d = N'' THROW 50015, N'Device not recognised - refresh the page and sign in again.', 1;
+    DECLARE @since DATETIME2(0) = DATEADD(DAY, -@ActiveDays, SYSUTCDATETIME());
+
+    BEGIN TRANSACTION;
+    IF EXISTS (SELECT 1 FROM dbo.TenantDevices WITH (UPDLOCK, HOLDLOCK) WHERE TenantId = @TenantId AND DeviceId = @d)
+    BEGIN
+        UPDATE dbo.TenantDevices
+           SET LastSeenDate = SYSUTCDATETIME(), UserEmail = COALESCE(LOWER(LTRIM(RTRIM(@Email))), UserEmail),
+               DeviceName = COALESCE(@DeviceName, DeviceName), IpAddress = COALESCE(@IpAddress, IpAddress)
+         WHERE TenantId = @TenantId AND DeviceId = @d;
+        COMMIT;
+        RETURN;
+    END;
+
+    DECLARE @limit INT = (SELECT MaxDevices FROM dbo.vw_TenantLogin WHERE TenantId = @TenantId);
+    DECLARE @count INT = (SELECT COUNT(*) FROM dbo.TenantDevices WITH (UPDLOCK, HOLDLOCK) WHERE TenantId = @TenantId AND LastSeenDate >= @since);
+    IF @limit > 0 AND @count >= @limit
+    BEGIN
+        DECLARE @msg NVARCHAR(300) = CONCAT(N'Your plan allows ', @limit, N' devices and all of them are in use. Use one of those devices, or ask your administrator to free a device or upgrade the plan.');
+        THROW 50014, @msg, 1;
+    END;
+
+    -- a device that was not used for a long time gives its place to the new one
+    DELETE dbo.TenantDevices WHERE TenantId = @TenantId AND LastSeenDate < @since;
+    INSERT dbo.TenantDevices (TenantId, DeviceId, UserEmail, DeviceName, IpAddress)
+    VALUES (@TenantId, @d, LOWER(LTRIM(RTRIM(@Email))), @DeviceName, @IpAddress);
     COMMIT;
 END;
 GO
@@ -308,6 +377,7 @@ BEGIN
     IF SUSER_ID(@LoginName) IS NULL THROW 50020, N'That SQL login does not exist on this server.', 1;
     DECLARE @result TABLE (DatabaseName SYSNAME, Outcome NVARCHAR(300));
     DECLARE @db SYSNAME, @sql NVARCHAR(MAX);
+    DECLARE @quoted NVARCHAR(300) = QUOTENAME(@LoginName);   -- EXEC parameters cannot be function calls
     DECLARE c CURSOR LOCAL FAST_FORWARD FOR
         SELECT DatabaseName FROM dbo.TenantDatabases WHERE DB_ID(DatabaseName) IS NOT NULL AND (@TenantId IS NULL OR TenantId = @TenantId);
     OPEN c; FETCH NEXT FROM c INTO @db;
@@ -319,7 +389,7 @@ EXEC (N''ALTER ROLE db_datareader ADD MEMBER '' + @ql);
 EXEC (N''ALTER ROLE db_datawriter ADD MEMBER '' + @ql);
 EXEC (N''GRANT EXECUTE TO '' + @ql);';
         BEGIN TRY
-            EXEC sys.sp_executesql @sql, N'@l SYSNAME, @ql NVARCHAR(300)', @l = @LoginName, @ql = QUOTENAME(@LoginName);
+            EXEC sys.sp_executesql @sql, N'@l SYSNAME, @ql NVARCHAR(300)', @l = @LoginName, @ql = @quoted;
             INSERT @result VALUES (@db, N'OK');
         END TRY
         BEGIN CATCH
@@ -344,7 +414,8 @@ BEGIN
         SET @g += N'CREATE USER ' + QUOTENAME(@BusinessApiLogin) + N' FOR LOGIN ' + QUOTENAME(@BusinessApiLogin) + N';';
     SELECT @g += N'GRANT EXECUTE ON dbo.' + QUOTENAME(p) + N' TO ' + QUOTENAME(@BusinessApiLogin) + N';'
     FROM (VALUES (N'usp_TenantLogin_FindByEmail'), (N'usp_TenantLogin_GetById'), (N'usp_TenantLogin_GetByCode'), (N'usp_TenantLogin_List'),
-                 (N'usp_TenantUsers_Add'), (N'usp_TenantUsers_ChangeEmail'), (N'usp_TenantUsers_Remove')) x(p);
+                 (N'usp_TenantUsers_Add'), (N'usp_TenantUsers_ChangeEmail'), (N'usp_TenantUsers_Remove'),
+                 (N'usp_TenantDevices_Register')) x(p);
     EXEC (@g);
     PRINT N'Granted the tenant login procedures to ' + @BusinessApiLogin;
 END

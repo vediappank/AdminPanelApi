@@ -51,4 +51,16 @@
     <None Include="..\TenantDatabase\**\*.sql" LinkBase="TenantDatabase" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Blog images that ship with the API (seed post covers). Published to App_Data\blog-images;
+         images uploaded later in the Admin Panel are written there on the server and are not touched. -->
+    <Content Include="App_Data\blog-images\**" CopyToPublishDirectory="PreserveNewest" CopyToOutputDirectory="Never" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- SuperAdminPanel database changes (..\DatabaseScripts\Migrations\NNN_*.sql) - copied to Migrations\ next to the
+         exe and run once each by SchemaMigrator when the API starts (see Services\SchemaMigrator.cs). -->
+    <None Include="..\DatabaseScripts\Migrations\*.sql" LinkBase="Migrations" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

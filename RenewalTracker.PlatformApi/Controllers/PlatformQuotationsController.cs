@@ -107,8 +107,9 @@ public class PlatformQuotationsController : ControllerBase
         }
 
         var contact = string.Join(" / ", new[] { enquiry?.Mobile, enquiry?.Email }.Where(v => !string.IsNullOrWhiteSpace(v)));
+        var branding = await PlatformDocumentBranding.ReadAsync(db);
         var data = new QuotationPdfData(
-            CompanyName: "Bliss Point Group",
+            CompanyName: branding.CompanyName,
             QuotationNumber: q.QuoteNo ?? $"Q-{q.QuotationId}",
             CustomerName: enquiry?.CustomerNameSnapshot ?? "-",
             EnquiryNumber: enquiry?.EnquiryNo ?? $"#{q.SalesEnquiryId}",
@@ -120,7 +121,9 @@ public class PlatformQuotationsController : ControllerBase
             Net: q.Subtotal,
             Vat: q.VatAmount,
             GrandTotal: q.GrandTotal,
-            Notes: q.Notes);
+            Notes: q.Notes,
+            Template: branding.QuotationTemplate,
+            LogoDataUrl: branding.LogoDataUrl);
 
         return QuotationPdfBuilder.Build(data);
     }

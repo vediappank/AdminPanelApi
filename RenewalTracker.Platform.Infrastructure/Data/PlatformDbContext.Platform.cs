@@ -51,6 +51,9 @@ public partial class PlatformDbContext
     public DbSet<TenantDatabase> TenantDatabases { get; set; } = null!;
     public DbSet<PlatformRole> PlatformRoles { get; set; } = null!;
     public DbSet<PlatformRoleModule> PlatformRoleModules { get; set; } = null!;
+    public DbSet<SubscriptionPlan> SubscriptionPlans { get; set; } = null!;
+    public DbSet<SubscriptionPlanMenu> SubscriptionPlanMenus { get; set; } = null!;
+    public DbSet<TenantSubscription> TenantSubscriptions { get; set; } = null!;
 
     partial void OnModelCreatingPartial(ModelBuilder modelBuilder)
     {
@@ -372,6 +375,38 @@ public partial class PlatformDbContext
             b.Property(x => x.CreatedDate).HasDefaultValueSql("SYSUTCDATETIME()");
             b.HasOne<Tenant>().WithMany().HasForeignKey(x => x.TenantId).OnDelete(DeleteBehavior.Cascade);
             b.HasOne<TenantMenuItem>().WithMany().HasForeignKey(x => x.MenuItemId).OnDelete(DeleteBehavior.Cascade);
+        });
+
+        // dbo.SubscriptionPlans / dbo.TenantSubscriptions - Billing > Subscriptions.
+        // See DatabaseScripts/Subscriptions_SuperAdminPanel.sql and PlatformSubscriptionsController.
+        modelBuilder.Entity<SubscriptionPlan>(b =>
+        {
+            b.ToTable("SubscriptionPlans");
+            b.HasIndex(x => x.PlanCode).IsUnique();
+            b.Property(x => x.IsActive).HasDefaultValueSql("1");
+            b.Property(x => x.IsDefault).HasDefaultValueSql("0");
+            b.Property(x => x.CreatedDate).HasDefaultValueSql("SYSUTCDATETIME()");
+        });
+
+        // dbo.SubscriptionPlanMenus - the Business Panel menus a plan includes (none = menus chosen by hand).
+        modelBuilder.Entity<SubscriptionPlanMenu>(b =>
+        {
+            b.ToTable("SubscriptionPlanMenus");
+            b.HasKey(x => new { x.SubscriptionPlanId, x.MenuItemId });
+            b.HasOne<SubscriptionPlan>().WithMany().HasForeignKey(x => x.SubscriptionPlanId).OnDelete(DeleteBehavior.Cascade);
+            b.HasOne<TenantMenuItem>().WithMany().HasForeignKey(x => x.MenuItemId).OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<TenantSubscription>(b =>
+        {
+            b.ToTable("TenantSubscriptions");
+            // at most one Active term per tenant
+            b.HasIndex(x => x.TenantId).IsUnique().HasFilter("[Status] = 'Active'").HasDatabaseName("UX_TenantSubscriptions_ActivePerTenant");
+            b.HasIndex(x => new { x.Status, x.EndDate });
+            b.Property(x => x.CreatedDate).HasDefaultValueSql("SYSUTCDATETIME()");
+            b.HasOne(x => x.Tenant).WithMany().HasForeignKey(x => x.TenantId).OnDelete(DeleteBehavior.Restrict);
+            b.HasOne(x => x.Plan).WithMany().HasForeignKey(x => x.SubscriptionPlanId).OnDelete(DeleteBehavior.Restrict);
+            b.HasOne(x => x.License).WithMany().HasForeignKey(x => x.LicenseId).OnDelete(DeleteBehavior.Restrict);
         });
 
         // dbo.TenantDatabases - database-per-tenant registry, created and kept up to date by TenantDatabaseService.

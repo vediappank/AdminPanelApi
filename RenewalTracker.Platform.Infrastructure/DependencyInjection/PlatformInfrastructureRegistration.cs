@@ -36,6 +36,10 @@ public static class PlatformInfrastructureRegistration
         services.AddScoped<ITenantDatabaseService, TenantDatabaseService>();
         services.AddHostedService<TenantDatabaseMigrationWorker>();
 
+        // Billing > Subscriptions - plans, tenant terms, and the job that renews / expires finished terms.
+        services.AddScoped<ISubscriptionService, SubscriptionService>();
+        services.AddHostedService<SubscriptionRenewalWorker>();
+
         // See IPlatformTenantProvisioningService - calls across to
         // RenewalTracker.Api's RequireInternalServiceKey-gated
         // api/internal/tenant-provisioning endpoint to finish standing up

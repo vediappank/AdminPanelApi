@@ -203,8 +203,19 @@ try
     builder.Services.AddHttpClient(WhatsAppCloud.HttpClientName, c => c.Timeout = TimeSpan.FromSeconds(30));
     builder.Services.AddSingleton<WhatsAppCloud>();
     builder.Services.AddSingleton<WebLeadNotifier>();
+    // Settings > Email & WhatsApp (dbo.PlatformMessagingSettings) - mailbox for this API's emails, read by the Business Panel API too
+    builder.Services.AddSingleton<PlatformMessagingStore>();
+    builder.Services.AddSingleton<PlatformChatbotStore>();
+    builder.Services.AddHostedService<PlatformChatbotSeeder>();
+    builder.Services.AddHostedService<PlatformMessagingRefresher>();
     // Self-check (database objects, Logs folder, origins) - startup log line + GET api/platform/diagnostics
     builder.Services.AddSingleton<ApiDiagnostics>();
+    // Settings > Deployments: which build of each site/API is live (version.json written by Deployment\publish-*.ps1)
+    builder.Services.AddHttpClient(DeploymentTracker.HttpClientName, c => c.Timeout = TimeSpan.FromSeconds(10));
+    builder.Services.AddSingleton<DeploymentTracker>();
+    builder.Services.AddHostedService<DeploymentWatcher>();
+    // SuperAdminPanel database changes: DatabaseScripts\Migrations\NNN_*.sql, run once each at startup (below)
+    builder.Services.AddSingleton<SchemaMigrator>();
 
     var app = builder.Build();
 
@@ -225,6 +236,10 @@ try
             app.Logger.LogError(ex, "Could not add dbo.PlatformUsers.Mobile - run DatabaseScripts/PlatformUsers_Mobile.sql on SuperAdminPanel");
         }
     }
+
+    // Database changes shipped with this build (Migrations\NNN_*.sql next to the exe) - each runs once, in order,
+    // recorded in dbo.SchemaMigrations. Never stops the API: a failure is logged and shown on Settings > Deployments.
+    app.Services.GetRequiredService<SchemaMigrator>().Run();
 
     // Temporary startup diagnostic - prints on every boot, regardless of the
     // Logging:LogLevel config, so a config-resolution problem (env var/user
@@ -330,6 +345,13 @@ try
                                    checks = await app.Services.GetRequiredService<ApiDiagnostics>().QuickCheckAsync() })
                 : Results.Ok(new { status = "ok", environment = env.EnvironmentName, time = DateTime.Now }))
         .AllowAnonymous();
+
+    // Build stamp (no auth): https://adminpanelapi.blisspointworld.com/version - version.json is written next to
+    // the exe by Deployment\publish-adminpanelapi.ps1 (app, version, git commit, built at/by), plus start time.
+    app.MapGet("/version", (IWebHostEnvironment env) =>
+            Results.Json(DeploymentTracker.ReadOwnStamp(DeploymentTracker.SelfKey, env)))
+        .AllowAnonymous()
+        .ExcludeFromDescription();
 
     app.Run();
 }

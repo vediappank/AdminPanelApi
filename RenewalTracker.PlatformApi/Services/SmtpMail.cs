@@ -20,7 +20,14 @@ public static class SmtpMail
         public bool IsConfigured => Host.Length > 0 && UserName.Length > 0 && Password.Length > 0 && FromEmail.Length > 0;
     }
 
-    public static Settings Read(IConfiguration config)
+    /// <summary>The mailbox of Settings ▸ Email & WhatsApp (PlatformMessagingStore) - used instead of the "Smtp" section while it is set and complete.</summary>
+    public static Settings? PlatformOverride { get; set; }
+
+    public static Settings Read(IConfiguration config) =>
+        PlatformOverride is { IsConfigured: true } platform ? platform : ReadAppSettings(config);
+
+    /// <summary>The "Smtp" section of appsettings.json only.</summary>
+    public static Settings ReadAppSettings(IConfiguration config)
     {
         var s = config.GetSection("Smtp");
         var userName = (s["UserName"] ?? string.Empty).Trim();
@@ -41,7 +48,12 @@ public static class SmtpMail
 
     public static Task SendAsync(Settings smtp, string to, IEnumerable<string> cc, string subject, string htmlBody,
         byte[] pdf, string pdfFileName, CancellationToken cancellationToken) =>
-        SendCoreAsync(smtp, new[] { to }, cc, subject, htmlBody, replyTo: null, pdf, pdfFileName, cancellationToken);
+        SendCoreAsync(smtp, new[] { to }, cc, subject, htmlBody, replyTo: null, pdf, pdfFileName, cancellationToken, System.Net.Mime.MediaTypeNames.Application.Pdf);
+
+    /// <summary>HTML email with one attached file (e.g. a CV from the careers page).</summary>
+    public static Task SendHtmlWithAttachmentAsync(Settings smtp, IEnumerable<string> to, string subject, string htmlBody,
+        string? replyTo, byte[] file, string fileName, string contentType, CancellationToken cancellationToken) =>
+        SendCoreAsync(smtp, to, Array.Empty<string>(), subject, htmlBody, replyTo, file, fileName, cancellationToken, contentType);
 
     /// <summary>
     /// HTML email with no attachment - used by the Website Leads alerts
@@ -50,10 +62,10 @@ public static class SmtpMail
     /// </summary>
     public static Task SendHtmlAsync(Settings smtp, IEnumerable<string> to, string subject, string htmlBody,
         string? replyTo, CancellationToken cancellationToken) =>
-        SendCoreAsync(smtp, to, Array.Empty<string>(), subject, htmlBody, replyTo, pdf: null, pdfFileName: null, cancellationToken);
+        SendCoreAsync(smtp, to, Array.Empty<string>(), subject, htmlBody, replyTo, pdf: null, pdfFileName: null, cancellationToken, null);
 
     private static async Task SendCoreAsync(Settings smtp, IEnumerable<string> to, IEnumerable<string> cc, string subject, string htmlBody,
-        string? replyTo, byte[]? pdf, string? pdfFileName, CancellationToken cancellationToken)
+        string? replyTo, byte[]? pdf, string? pdfFileName, CancellationToken cancellationToken, string? contentType)
     {
         using var message = new MailMessage
         {
@@ -74,7 +86,7 @@ public static class SmtpMail
             if (pdf != null)
             {
                 pdfStream = new MemoryStream(pdf, writable: false);
-                message.Attachments.Add(new Attachment(pdfStream, pdfFileName ?? "document.pdf", System.Net.Mime.MediaTypeNames.Application.Pdf));
+                message.Attachments.Add(new Attachment(pdfStream, pdfFileName ?? "document.pdf", contentType ?? System.Net.Mime.MediaTypeNames.Application.Pdf));
             }
 
             using var client = new SmtpClient(smtp.Host, smtp.Port)

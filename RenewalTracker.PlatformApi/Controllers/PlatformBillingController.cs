@@ -1,3 +1,5 @@
+using System.Globalization;
+using System.Text.RegularExpressions;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
@@ -5,6 +7,7 @@ using RenewalTracker.Platform.Application.DTOs.Billing;
 using RenewalTracker.Platform.Domain.Entities;
 using RenewalTracker.Platform.Infrastructure.Data;
 using RenewalTracker.PlatformApi.Filters;
+using RenewalTracker.PlatformApi.Services;
 
 namespace RenewalTracker.PlatformApi.Controllers;
 
@@ -32,11 +35,152 @@ namespace RenewalTracker.PlatformApi.Controllers;
 [RequirePlatformAuth]
 public class PlatformBillingController : ControllerBase
 {
-    private readonly PlatformDbContext _db;
+    private static readonly Regex EmailPattern = new(@"^[^@\s]+@[^@\s]+\.[^@\s]+$", RegexOptions.Compiled);
 
-    public PlatformBillingController(PlatformDbContext db)
+    private readonly PlatformDbContext _db;
+    private readonly IConfiguration _config;
+    private readonly ILogger<PlatformBillingController> _logger;
+
+    public PlatformBillingController(PlatformDbContext db, IConfiguration config, ILogger<PlatformBillingController> logger)
     {
         _db = db;
+        _config = config;
+        _logger = logger;
+    }
+
+    // ------------------------------------------------------------------ payment receipts
+
+    public class EmailReceiptRequest
+    {
+        /// <summary>Default: the tenant's contact e-mail (license payments) or the enquiry's e-mail (quotation payments).</summary>
+        public string? To { get; set; }
+        public List<string>? Cc { get; set; }
+    }
+
+    public class ReceiptInfoDto
+    {
+        public string ReceiptNumber { get; set; } = string.Empty;
+        public string? DefaultEmail { get; set; }
+        public bool EmailConfigured { get; set; }
+    }
+
+    /// <summary>Receipt PDF for one payment - inline (preview) or ?download=true. Uses Settings > Branding (name, logo, receipt template).</summary>
+    [HttpGet("payments/{id:int}/receipt")]
+    public async Task<IActionResult> GetReceipt(int id, [FromQuery] bool download = false, CancellationToken ct = default)
+    {
+        var receipt = await BuildReceiptAsync(id, ct);
+        if (receipt == null) return NotFound(new { message = "Payment not found." });
+        if (download) return File(receipt.Pdf, "application/pdf", receipt.FileName);
+        Response.Headers.ContentDisposition = $"inline; filename=\"{receipt.FileName}\"";
+        return File(receipt.Pdf, "application/pdf");
+    }
+
+    /// <summary>Receipt number and default recipient for the Email receipt dialog.</summary>
+    [HttpGet("payments/{id:int}/receipt/info")]
+    public async Task<ActionResult<ReceiptInfoDto>> GetReceiptInfo(int id, CancellationToken ct)
+    {
+        var receipt = await BuildReceiptAsync(id, ct, pdf: false);
+        if (receipt == null) return NotFound(new { message = "Payment not found." });
+        return Ok(new ReceiptInfoDto { ReceiptNumber = receipt.Number, DefaultEmail = receipt.Email, EmailConfigured = SmtpMail.Read(_config).IsConfigured });
+    }
+
+    /// <summary>E-mails the receipt PDF to the payer.</summary>
+    [HttpPost("payments/{id:int}/receipt/email")]
+    public async Task<IActionResult> EmailReceipt(int id, EmailReceiptRequest request, CancellationToken ct)
+    {
+        var receipt = await BuildReceiptAsync(id, ct);
+        if (receipt == null) return NotFound(new { message = "Payment not found." });
+
+        var to = (string.IsNullOrWhiteSpace(request?.To) ? receipt.Email : request!.To)?.Trim();
+        if (string.IsNullOrWhiteSpace(to)) return BadRequest(new { message = "There is no e-mail address for this customer - enter one." });
+        if (!EmailPattern.IsMatch(to)) return BadRequest(new { message = "Enter a valid e-mail address." });
+        var cc = (request?.Cc ?? new List<string>()).Select(c => c.Trim()).Where(c => c.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        foreach (var address in cc)
+            if (!EmailPattern.IsMatch(address)) return BadRequest(new { message = $"Invalid CC e-mail address: {address}" });
+
+        var smtp = SmtpMail.Read(_config);
+        if (!smtp.IsConfigured) return BadRequest(new { message = "Email is not set up on the server (Smtp section of appsettings.json). Download the receipt instead." });
+
+        var html = SmtpMail.ToHtml($"Dear {receipt.Payer},\n\nThank you for your payment. Please find your receipt {receipt.Number} attached.\n\nRegards,\n{receipt.Company}", new[]
+        {
+            ("Receipt No", receipt.Number),
+            ("Date", receipt.Date.ToString("dd MMM yyyy", CultureInfo.InvariantCulture)),
+            ("Amount", receipt.AmountText),
+            ("Against", receipt.Against),
+        });
+        try
+        {
+            await SmtpMail.SendAsync(smtp, to, cc, $"Payment receipt {receipt.Number} - {receipt.Company}", html, receipt.Pdf, receipt.FileName, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to email receipt {Receipt}", receipt.Number);
+            return BadRequest(new { message = $"Email could not be sent: {ex.Message}" });
+        }
+        return Ok(new { message = $"Receipt {receipt.Number} emailed to {to}." });
+    }
+
+    private sealed record BuiltReceipt(byte[] Pdf, string FileName, string Number, string? Email, string Payer, string Company, DateTime Date, string AmountText, string Against);
+
+    private async Task<BuiltReceipt?> BuildReceiptAsync(int paymentId, CancellationToken ct, bool pdf = true)
+    {
+        var p = await _db.Payments.AsNoTracking().FirstOrDefaultAsync(x => x.PaymentId == paymentId, ct);
+        if (p == null) return null;
+        var branding = await PlatformDocumentBranding.ReadAsync(_db, ct);
+        var tenant = p.TenantId is int tid ? await _db.Tenants.AsNoTracking().FirstOrDefaultAsync(t => t.TenantId == tid, ct) : null;
+
+        var currency = "AED";
+        string against, description;
+        decimal? total = null;
+        string? email = tenant?.ContactEmail;
+        var lines = new List<string>();
+        if (tenant != null) lines.Add($"Customer Code: {tenant.TenantCode}");
+        if (!string.IsNullOrWhiteSpace(tenant?.ContactName)) lines.Add($"Contact: {tenant!.ContactName}");
+
+        if (p.QuotationId is int qid)
+        {
+            var q = await _db.Quotations.AsNoTracking().FirstOrDefaultAsync(x => x.QuotationId == qid, ct);
+            var invoice = await _db.Invoices.AsNoTracking().FirstOrDefaultAsync(i => i.QuotationId == qid, ct);
+            var enquiry = q == null ? null : await _db.Enquiries.AsNoTracking().FirstOrDefaultAsync(e => e.SalesEnquiryId == q.SalesEnquiryId, ct);
+            var quoteNo = q?.QuoteNo ?? $"Q-{qid}";
+            against = invoice != null ? $"Invoice {invoice.InvoiceNumber}" : $"Quotation {quoteNo}";
+            description = invoice != null ? $"Payment towards invoice {invoice.InvoiceNumber} (quotation {quoteNo})" : $"Payment towards quotation {quoteNo}";
+            total = q?.GrandTotal;
+            email = string.IsNullOrWhiteSpace(enquiry?.Email) ? email : enquiry!.Email;
+            if (enquiry != null && tenant == null)
+            {
+                if (!string.IsNullOrWhiteSpace(enquiry.ContactPerson)) lines.Add($"Contact: {enquiry.ContactPerson}");
+                lines.Add(string.Join(" / ", new[] { enquiry.Mobile, enquiry.Email }.Where(v => !string.IsNullOrWhiteSpace(v))));
+            }
+        }
+        else
+        {
+            var license = p.LicenseId is int lid ? await _db.Licenses.AsNoTracking().FirstOrDefaultAsync(l => l.LicenseId == lid, ct) : null;
+            // the subscription term running on the payment date (or the latest one) names the plan
+            var sub = p.LicenseId == null ? null : await _db.TenantSubscriptions.AsNoTracking().Include(s => s.Plan)
+                .Where(s => s.LicenseId == p.LicenseId && s.StartDate <= p.Date)
+                .OrderByDescending(s => s.StartDate).FirstOrDefaultAsync(ct);
+            if (sub != null) currency = sub.Currency;
+            against = sub != null ? $"Subscription {sub.Plan.PlanName} ({sub.BillingCycle})" : $"License {license?.LicenseKey}";
+            description = sub != null
+                ? $"Subscription {sub.Plan.PlanName} - {sub.BillingCycle}, {sub.StartDate:dd MMM yyyy} to {sub.EndDate:dd MMM yyyy} (license {license?.LicenseKey})"
+                : $"License renewal - {license?.LicenseKey}";
+            total = license?.RenewalAmount;
+        }
+        if (!string.IsNullOrWhiteSpace(tenant?.ContactMobile)) lines.Add(tenant!.ContactMobile!);
+        if (!string.IsNullOrWhiteSpace(email) && !lines.Any(l => l.Contains(email!, StringComparison.OrdinalIgnoreCase))) lines.Add(email!);
+
+        // paid up to and including this payment (same quotation / license)
+        var sameTarget = _db.Payments.AsNoTracking().Where(x => p.QuotationId != null ? x.QuotationId == p.QuotationId : x.LicenseId == p.LicenseId);
+        var paidToDate = await sameTarget.Where(x => x.Date < p.Date || (x.Date == p.Date && x.PaymentId <= p.PaymentId)).SumAsync(x => (decimal?)x.Amount, ct) ?? 0m;
+
+        var number = string.IsNullOrWhiteSpace(p.InvoiceNo) ? $"RCPT-{p.PaymentId:D6}" : p.InvoiceNo!;
+        var payer = string.IsNullOrWhiteSpace(p.CustomerNameSnapshot) ? tenant?.TenantName ?? "Customer" : p.CustomerNameSnapshot;
+        var bytes = !pdf ? Array.Empty<byte>() : PaymentReceiptPdf.Build(new PaymentReceiptData(
+            branding.CompanyName, branding.LogoDataUrl, branding.ReceiptTemplate, number, p.Date, payer, lines, p.Method, null,
+            against, description, p.Amount, currency, total is > 0 ? total : null, total is > 0 ? paidToDate : null, p.Status));
+        var safeName = Regex.Replace(number, @"[^A-Za-z0-9_-]", "_");
+        return new BuiltReceipt(bytes, $"Receipt-{safeName}.pdf", number, email, payer, branding.CompanyName, p.Date, $"{currency} {p.Amount:N2}", against);
     }
 
     /// <summary>Optionally filtered by tenant, quotation, or license - e.g. a tenant's full payment history, or one quotation's installments.</summary>

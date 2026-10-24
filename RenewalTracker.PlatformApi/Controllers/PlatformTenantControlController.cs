@@ -5,6 +5,7 @@ using RenewalTracker.Platform.Domain.Entities;
 using RenewalTracker.Platform.Infrastructure.Data;
 using RenewalTracker.Platform.Infrastructure.Services;
 using RenewalTracker.PlatformApi.Filters;
+using RenewalTracker.PlatformApi.Services;
 
 namespace RenewalTracker.PlatformApi.Controllers;
 
@@ -20,6 +21,8 @@ namespace RenewalTracker.PlatformApi.Controllers;
 ///   POST api/platform/tenants/{id}/database/verify     (operator confirms - provisioning complete)
 ///   PUT  api/platform/tenants/{id}/database/options    { databaseMode, databaseName, dbUser, dbPassword, runNow }  (Automatic / Manual)
 ///   GET  api/platform/tenants/database-defaults?tenantCode=   (Provision tenant form: default mode, suggested name, SQL login)
+///   GET  api/platform/tenants/{id}/branding           company name + logo the Business Panel shows after login
+///   PUT  api/platform/tenants/{id}/branding           { companyName, logoDataUrl }
 /// </summary>
 [ApiController]
 [Route("api/platform/tenants/{tenantId:int}")]
@@ -61,7 +64,10 @@ public class PlatformTenantControlController : ControllerBase
         public DateTime? DatabaseCreatedDate { get; set; }
         public bool IsDatabaseEnabled { get; set; }
         public int? ProvisioningStep { get; set; }
+        /// <summary>Set only when the last run stopped with an error (Status = Failed).</summary>
         public string? ProvisioningError { get; set; }
+        /// <summary>The last run finished, but reported something to check (e.g. a changed script, a missing master-data table).</summary>
+        public string? ProvisioningWarning { get; set; }
         /// <summary>True while the background worker is building / updating the database (Pending or Running).</summary>
         public bool IsProvisioning { get; set; }
         /// <summary>True when the database is ready but no owner login was entered (tenants created before this) -
@@ -94,6 +100,25 @@ public class PlatformTenantControlController : ControllerBase
         public string? DbPassword { get; set; }
         /// <summary>True = start provisioning straight away with the new choice (Run again).</summary>
         public bool RunNow { get; set; }
+    }
+
+    public class SetBrandingRequest
+    {
+        /// <summary>Shown in the Business Panel header. Empty = the tenant's name.</summary>
+        public string? CompanyName { get; set; }
+        /// <summary>Logo as a data URL (data:image/png;base64,...), max 300 KB. Empty = no logo (Bliss Point logo shown).</summary>
+        public string? LogoDataUrl { get; set; }
+        /// <summary>PDF template per document: classic / modern / elegant / minimal. Null = keep the current one.</summary>
+        public string? QuotationTemplate { get; set; }
+        public string? InvoiceTemplate { get; set; }
+        public string? ReceiptTemplate { get; set; }
+    }
+
+    public class BrandingResult
+    {
+        public bool Success { get; set; }
+        public string? Message { get; set; }
+        public TenantBranding? Branding { get; set; }
     }
 
     public class DatabaseActionResult
@@ -137,6 +162,40 @@ public class PlatformTenantControlController : ControllerBase
     public async Task<ActionResult<DatabaseActionResult>> SetDatabaseOptions(int tenantId, SetDatabaseOptionsRequest request, CancellationToken ct)
         => await RunAsync(tenantId, () => _databases.SetDatabaseOptionsAsync(
             tenantId, new TenantDatabaseOptions(request.DatabaseMode, request.DatabaseName, request.DbUser, request.DbPassword), request.RunNow, ct));
+
+    [HttpGet("branding")]
+    public async Task<ActionResult<TenantBranding>> GetBranding(int tenantId, CancellationToken ct)
+    {
+        if (!await _db.Tenants.AnyAsync(t => t.TenantId == tenantId, ct)) return NotFound(new { message = "Tenant not found." });
+        return Ok(await _databases.GetBrandingAsync(tenantId, ct));
+    }
+
+    [HttpPut("branding")]
+    [RequestSizeLimit(1_000_000)]   // a 300 KB logo is about 400 KB as a data URL
+    public async Task<ActionResult<BrandingResult>> SetBranding(int tenantId, SetBrandingRequest request, CancellationToken ct)
+    {
+        if (!await _db.Tenants.AnyAsync(t => t.TenantId == tenantId, ct)) return NotFound(new { message = "Tenant not found." });
+        var result = await _databases.SetBrandingAsync(tenantId, request.CompanyName, request.LogoDataUrl, ct,
+            request.QuotationTemplate, request.InvoiceTemplate, request.ReceiptTemplate);
+        var body = new BrandingResult { Success = result.Success, Message = result.Message, Branding = await _databases.GetBrandingAsync(tenantId, ct) };
+        return result.Success ? Ok(body) : BadRequest(body);
+    }
+
+    /// <summary>Tenants list: company name + whether a logo is set, for every tenant (logos via GET .../{id}/logo).</summary>
+    [HttpGet("~/api/platform/tenants/branding-summary")]
+    public async Task<ActionResult<List<TenantBrandingSummary>>> BrandingSummary(CancellationToken ct)
+        => Ok(await _databases.GetBrandingSummaryAsync(ct));
+
+    /// <summary>Sample PDF of a template with this tenant's name and logo - Control Center template picker preview.</summary>
+    [HttpGet("branding/preview")]
+    public async Task<IActionResult> PreviewTemplate(int tenantId, [FromQuery] string? template, [FromQuery] string? document, CancellationToken ct)
+    {
+        var branding = await _databases.GetBrandingAsync(tenantId, ct);
+        var name = string.IsNullOrWhiteSpace(branding.CompanyName) ? branding.DefaultName : branding.CompanyName;
+        var pdf = TemplatePreview.Build(DocumentTemplates.Normalize(template), document, name ?? "Company", branding.LogoDataUrl);
+        Response.Headers.ContentDisposition = "inline; filename=\"template-preview.pdf\"";
+        return File(pdf, "application/pdf");
+    }
 
     [HttpGet("database/progress")]
     public async Task<ActionResult<TenantDatabaseProgress>> Progress(int tenantId, CancellationToken ct)
@@ -204,7 +263,9 @@ public class PlatformTenantControlController : ControllerBase
             DatabaseCreatedDate = reg != null && reg.ProvisioningStep > TenantDatabaseService.StepDatabase ? reg.CreatedDate : null,
             IsDatabaseEnabled = reg?.IsEnabled ?? tenant.IsActive,
             ProvisioningStep = reg?.ProvisioningStep ?? 0,
-            ProvisioningError = reg?.Status == "Failed" || !string.IsNullOrEmpty(reg?.LastError) ? reg?.LastError : null,
+            // LastError also carries the warnings of a run that finished - those are not a failure.
+            ProvisioningError = reg?.Status == "Failed" ? (string.IsNullOrEmpty(reg.LastError) ? "Provisioning failed." : reg.LastError) : null,
+            ProvisioningWarning = reg != null && reg.Status != "Failed" && !string.IsNullOrEmpty(reg.LastError) ? reg.LastError : null,
             IsProvisioning = reg?.Status is "Pending" or "Running",
             OwnerMissing = reg != null && reg.ProvisioningStep == TenantDatabaseService.StepOwner && reg.Status == "Ready" && reg.OwnerUserId == null && string.IsNullOrEmpty(reg.OwnerPasswordHash),
             AwaitingVerification = reg != null && reg.ProvisioningStep == TenantDatabaseService.StepVerify && reg.Status == "Ready",

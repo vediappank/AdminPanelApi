@@ -380,8 +380,9 @@ public class PlatformInvoicesController : ControllerBase
         }
 
         var contact = string.Join(" / ", new[] { enquiry?.Mobile, enquiry?.Email }.Where(v => !string.IsNullOrWhiteSpace(v)));
+        var branding = await PlatformDocumentBranding.ReadAsync(_db);
         return QuotationPdfBuilder.Build(new QuotationPdfData(
-            CompanyName: CompanyName,
+            CompanyName: branding.CompanyName,
             QuotationNumber: invoice.InvoiceNumber,
             CustomerName: enquiry?.CustomerNameSnapshot ?? "-",
             EnquiryNumber: quotation?.QuoteNo ?? $"Q-{invoice.QuotationId}",
@@ -402,7 +403,9 @@ public class PlatformInvoicesController : ControllerBase
             {
                 "Payment is due by the due date shown above.",
                 "Please quote the invoice number with your payment.",
-            }));
+            },
+            Template: branding.InvoiceTemplate,
+            LogoDataUrl: branding.LogoDataUrl));
     }
 
     private static string BuildEmailHtml(string body, Invoice invoice)

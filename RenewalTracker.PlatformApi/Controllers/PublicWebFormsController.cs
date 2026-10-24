@@ -145,14 +145,15 @@ public partial class PublicWebFormsController : ControllerBase
             return BadRequest(new { message = string.Join(" ", errors), errors });
 
         // Stored outside wwwroot under a random name - only the Admin Panel can download it.
-        var folder = CvFolder();
-        Directory.CreateDirectory(folder);
-        var storedName = $"{DateTime.UtcNow:yyyyMM}_{Guid.NewGuid():N}{extension.ToLowerInvariant()}";
-        var fullPath = Path.Combine(folder, storedName);
-        await using (var stream = new FileStream(fullPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, useAsync: true))
+        // The CV is also attached to the HR email, so HR gets it even if disk storage fails.
+        byte[] cvBytes;
+        await using (var ms = new MemoryStream((int)cv!.Length))
         {
-            await cv!.CopyToAsync(stream, ct);
+            await cv.CopyToAsync(ms, ct);
+            cvBytes = ms.ToArray();
         }
+        var storedName = $"{DateTime.UtcNow:yyyyMM}_{Guid.NewGuid():N}{extension.ToLowerInvariant()}";
+        var fullPath = await SaveCvAsync(storedName, cvBytes, ct);
 
         WebJobApplicationInsertResult result;
         try
@@ -177,12 +178,13 @@ public partial class PublicWebFormsController : ControllerBase
         }
         catch
         {
-            TryDelete(fullPath);
+            if (fullPath != null) TryDelete(fullPath);
             throw;
         }
 
-        _logger.LogInformation("Website job application {Reference} ({Role})", result.ReferenceNo, result.RoleApplied);
-        await _notifier.JobApplicationReceivedAsync(result);
+        _logger.LogInformation("Website job application {Reference} ({Role}) - CV {Stored}", result.ReferenceNo, result.RoleApplied,
+            fullPath ?? "NOT STORED (emailed only)");
+        await _notifier.JobApplicationReceivedAsync(result, cvBytes, SafeDisplayName(cv.FileName), CvTypes[extension]);
 
         return Ok(new PublicSubmitResponse
         {
@@ -203,6 +205,37 @@ public partial class PublicWebFormsController : ControllerBase
     }
 
     private string CvFolder() => CvFolder(_config, _env);
+
+    /// <summary>Second place to keep CVs when the configured folder can't be written (e.g. IIS app-pool permissions on Plesk).</summary>
+    internal static string CvFallbackFolder() => Path.Combine(Path.GetTempPath(), "BlissPoint", "cv");
+
+    /// <summary>The configured CV folder first, then the fallback - used by the Admin Panel download.</summary>
+    internal static IEnumerable<string> CvFolders(IConfiguration config, IWebHostEnvironment env)
+    {
+        yield return CvFolder(config, env);
+        yield return CvFallbackFolder();
+    }
+
+    /// <summary>Writes the CV to the configured folder, or the fallback folder; returns the full path, or null if neither worked.</summary>
+    private async Task<string?> SaveCvAsync(string storedName, byte[] bytes, CancellationToken ct)
+    {
+        foreach (var folder in new[] { CvFolder(), CvFallbackFolder() })
+        {
+            try
+            {
+                Directory.CreateDirectory(folder);
+                var path = Path.Combine(folder, storedName);
+                await using var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, useAsync: true);
+                await stream.WriteAsync(bytes, ct);
+                return path;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                _logger.LogError(ex, "Could not save CV in {Folder} - check the IIS app pool has write access (Website:CvStoragePath)", folder);
+            }
+        }
+        return null;
+    }
 
     private static string ThankYou(string requestType) => requestType switch
     {

@@ -148,10 +148,15 @@ public class PlatformWebLeadsController : ControllerBase
         var cv = await _repo.GetJobApplicationCvAsync(id, ct);
         if (cv == null) return NotFound(new { message = "Job application not found." });
 
-        var folder = Path.GetFullPath(PublicWebFormsController.CvFolder(_config, _env));
-        var fullPath = Path.GetFullPath(Path.Combine(folder, Path.GetFileName(cv.CvFilePath)));
-        if (!fullPath.StartsWith(folder, StringComparison.OrdinalIgnoreCase) || !System.IO.File.Exists(fullPath))
-            return NotFound(new { message = "The CV file is no longer on the server." });
+        string? fullPath = null;
+        foreach (var dir in PublicWebFormsController.CvFolders(_config, _env))
+        {
+            var folder = Path.GetFullPath(dir);
+            var candidate = Path.GetFullPath(Path.Combine(folder, Path.GetFileName(cv.CvFilePath)));
+            if (candidate.StartsWith(folder, StringComparison.OrdinalIgnoreCase) && System.IO.File.Exists(candidate)) { fullPath = candidate; break; }
+        }
+        if (fullPath == null)
+            return NotFound(new { message = "The CV file is no longer on the server - it was also emailed to the careers inbox when the application arrived." });
 
         var stream = new FileStream(fullPath, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, useAsync: true);
         return File(stream, cv.CvContentType ?? "application/octet-stream", cv.CvFileName);

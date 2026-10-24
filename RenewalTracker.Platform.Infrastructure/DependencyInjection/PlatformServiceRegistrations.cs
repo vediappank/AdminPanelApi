@@ -29,5 +29,8 @@ public static class PlatformServiceRegistrations
 
         // Website Settings - social links etc. the website reads at runtime (dbo.usp_WebSetting_*).
         services.AddScoped<IWebSettingRepository, WebSettingRepository>();
+
+        // Website Blog - posts and categories shown on the website (dbo.BlogPost / dbo.BlogCategory).
+        services.AddScoped<IBlogRepository, BlogRepository>();
     }
 }
