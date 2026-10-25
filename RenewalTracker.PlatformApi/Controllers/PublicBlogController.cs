@@ -81,7 +81,7 @@ public class PublicBlogController : ControllerBase
         Ok(await Cached("categories", () => _repo.ListPublicCategoriesAsync(ct)));
 
     [HttpGet("posts")]
-    [ResponseCache(Duration = 60, Location = ResponseCacheLocation.Any, VaryByQueryKeys = new[] { "*" })]
+    [ResponseCache(Duration = 60, Location = ResponseCacheLocation.Any)]   // the query string is part of the URL, so browsers/CDNs cache each list separately anyway
     public async Task<ActionResult<PublicBlogPage>> Posts([FromQuery] string? category, [FromQuery] string? tag, [FromQuery] string? q,
         [FromQuery] int page = 1, [FromQuery] int pageSize = 9, CancellationToken ct = default)
     {

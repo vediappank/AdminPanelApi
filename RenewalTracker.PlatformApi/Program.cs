@@ -348,8 +348,29 @@ try
 
     // Build stamp (no auth): https://adminpanelapi.blisspointworld.com/version - version.json is written next to
     // the exe by Deployment\publish-adminpanelapi.ps1 (app, version, git commit, built at/by), plus start time.
-    app.MapGet("/version", (IWebHostEnvironment env) =>
-            Results.Json(DeploymentTracker.ReadOwnStamp(DeploymentTracker.SelfKey, env)))
+    // + which DatabaseScripts\Migrations scripts ran on this database (names only) - read by Bliss Deploy's Database tab
+    app.MapGet("/version", (IWebHostEnvironment env, SchemaMigrator migrator) =>
+        {
+            var stamp = DeploymentTracker.ReadOwnStamp(DeploymentTracker.SelfKey, env);
+            var m = migrator.Last;
+            var applied = new System.Text.Json.Nodes.JsonArray();
+            var changed = new System.Text.Json.Nodes.JsonArray();
+            foreach (var s in m.Scripts)
+            {
+                if (s.Status is "applied" or "changed") applied.Add(s.Name);
+                if (s.Status == "changed") changed.Add(s.Name);
+            }
+            stamp["migrations"] = new System.Text.Json.Nodes.JsonObject
+            {
+                ["enabled"] = m.Enabled,
+                ["ranAt"] = m.RanAt,
+                ["applied"] = applied,
+                ["changed"] = changed,
+                ["failed"] = m.Scripts.FirstOrDefault(s => s.Status == "failed")?.Name,
+                ["pending"] = m.Pending,
+            };
+            return Results.Json(stamp);
+        })
         .AllowAnonymous()
         .ExcludeFromDescription();
 
