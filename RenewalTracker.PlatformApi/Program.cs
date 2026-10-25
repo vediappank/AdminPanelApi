@@ -218,6 +218,12 @@ try
     builder.Services.AddSingleton<SchemaMigrator>();
     // Website visitor counter (js/bp-visits.js -> api/public/visits, Admin Panel > Website Leads > Visitors)
     builder.Services.AddSingleton<WebsiteVisitStore>();
+    // Website sign-up for new posts (email + WhatsApp codes) and the automatic "new posts" messages
+    // (api/public/subscribers, Admin Panel > Website Leads > Subscribers, "Newsletter" section of appsettings)
+    builder.Services.AddSingleton<SubscriberStore>();
+    builder.Services.AddSingleton<SubscriberMessenger>();
+    builder.Services.AddSingleton<NewsletterWorker>();
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<NewsletterWorker>());
 
     var app = builder.Build();
 

@@ -37,8 +37,8 @@ public sealed class WebsiteVisitStore
         _connection = config.GetConnectionString("DefaultConnection") ?? string.Empty;
     }
 
-    /// <summary>The public counter shows only from this many visitors this year (Website:VisitorCounterMinimum, default 1000).</summary>
-    public int ShowFrom => Math.Max(0, _config.GetValue("Website:VisitorCounterMinimum", 1000));
+    /// <summary>The public counter shows only from this many visitors this year (Website:VisitorCounterMinimum, default 1 - shown from the first visitor).</summary>
+    public int ShowFrom => Math.Max(0, _config.GetValue("Website:VisitorCounterMinimum", 1));
 
     public static bool IsBot(string? userAgent) => string.IsNullOrWhiteSpace(userAgent) || BotRule.IsMatch(userAgent);
 
@@ -127,6 +127,7 @@ SELECT
 
     public sealed record DayRow(DateTime Day, int Visitors, int PageViews);
     public sealed record NameCount(string Name, int Count);
+    public sealed class PeriodTotals { public int Visitors { get; set; } public int PageViews { get; set; } }
 
     /// <summary>Admin Panel > Website Leads > Visitors.</summary>
     public async Task<object> ReportAsync(int days, CancellationToken ct)
@@ -146,8 +147,11 @@ SELECT ISNULL(Device, 'unknown') AS Name, COUNT(*) AS Count FROM dbo.WebsiteVisi
 
 SELECT TOP 10 LandingPath AS Name, COUNT(*) AS Count FROM dbo.WebsiteVisits WHERE VisitDate >= @From GROUP BY LandingPath ORDER BY COUNT(*) DESC;
 
-SELECT COUNT(DISTINCT VisitorId) FROM dbo.WebsiteVisits WHERE VisitDate >= @From;",
-            new { From = from }, cancellationToken: ct));
+SELECT COUNT(DISTINCT VisitorId) FROM dbo.WebsiteVisits WHERE VisitDate >= @From;
+
+SELECT COUNT(DISTINCT VisitorId) AS Visitors, ISNULL(SUM(PageViews), 0) AS PageViews
+FROM dbo.WebsiteVisits WHERE VisitDate >= @PrevFrom AND VisitDate < @From;",
+            new { From = from, PrevFrom = from.AddDays(-days) }, cancellationToken: ct));
 
         var daily = (await multi.ReadAsync<DayRow>()).ToDictionary(d => d.Day.Date);
         var series = Enumerable.Range(0, days).Select(i => from.AddDays(i))
@@ -157,10 +161,12 @@ SELECT COUNT(DISTINCT VisitorId) FROM dbo.WebsiteVisits WHERE VisitDate >= @From
         var devices = (await multi.ReadAsync<NameCount>()).ToList();
         var landing = (await multi.ReadAsync<NameCount>()).ToList();
         var unique = await multi.ReadSingleAsync<int>();
+        var previous = await multi.ReadSingleAsync<PeriodTotals>();
         var summary = await SummaryAsync(ct);
         return new
         {
             days, from, uniqueVisitors = unique,
+            previousVisitors = previous.Visitors, previousPageViews = previous.PageViews,
             visits = series.Sum(s => s.Visitors), pageViews = series.Sum(s => s.PageViews),
             series, pages, sources, devices, landing, summary,
             excludeLink = (_config["Website:PublicUrl"] ?? "https://blisspointworld.com").TrimEnd('/') + "/?bp-internal=1",

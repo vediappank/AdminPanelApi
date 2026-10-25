@@ -64,8 +64,17 @@ public static class SmtpMail
         string? replyTo, CancellationToken cancellationToken) =>
         SendCoreAsync(smtp, to, Array.Empty<string>(), subject, htmlBody, replyTo, pdf: null, pdfFileName: null, cancellationToken, null);
 
+    /// <summary>
+    /// HTML email to one person with extra headers - the website "new posts" messages (SubscriberMessenger) add
+    /// List-Unsubscribe / List-Unsubscribe-Post so Gmail and Outlook show their own one-click Unsubscribe.
+    /// </summary>
+    public static Task SendHtmlWithHeadersAsync(Settings smtp, string to, string subject, string htmlBody,
+        string? replyTo, IReadOnlyDictionary<string, string> headers, CancellationToken cancellationToken) =>
+        SendCoreAsync(smtp, new[] { to }, Array.Empty<string>(), subject, htmlBody, replyTo, pdf: null, pdfFileName: null, cancellationToken, null, headers);
+
     private static async Task SendCoreAsync(Settings smtp, IEnumerable<string> to, IEnumerable<string> cc, string subject, string htmlBody,
-        string? replyTo, byte[]? pdf, string? pdfFileName, CancellationToken cancellationToken, string? contentType)
+        string? replyTo, byte[]? pdf, string? pdfFileName, CancellationToken cancellationToken, string? contentType,
+        IReadOnlyDictionary<string, string>? headers = null)
     {
         using var message = new MailMessage
         {
@@ -79,6 +88,7 @@ public static class SmtpMail
         foreach (var address in to) message.To.Add(new MailAddress(address));
         foreach (var address in cc) message.CC.Add(new MailAddress(address));
         if (!string.IsNullOrWhiteSpace(replyTo)) message.ReplyToList.Add(new MailAddress(replyTo));
+        if (headers != null) foreach (var h in headers) message.Headers.Add(h.Key, h.Value);
 
         MemoryStream? pdfStream = null;
         try

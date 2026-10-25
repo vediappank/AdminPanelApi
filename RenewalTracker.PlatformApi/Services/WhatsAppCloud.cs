@@ -138,6 +138,56 @@ public class WhatsAppCloud
     }
 
     /// <summary>
+    /// Sends a one-time code with an approved AUTHENTICATION template (Meta's "Copy code" template):
+    /// the code goes in the body {{1}} and in the copy-code button. Returns true when Meta accepted it.
+    /// Used by the website sign-up / login (SubscriberMessenger). Never throws for API errors.
+    /// </summary>
+    public async Task<bool> SendAuthCodeAsync(Settings settings, string toPhone, Template template, string code, CancellationToken cancellationToken)
+    {
+        if (!settings.IsConfigured || !template.IsSet) return false;
+        var to = NormalizePhone(toPhone, settings.DefaultCountryCode);
+        if (to == null) return false;
+        var payload = new Dictionary<string, object?>
+        {
+            ["messaging_product"] = "whatsapp",
+            ["recipient_type"] = "individual",
+            ["to"] = to,
+            ["type"] = "template",
+            ["template"] = new Dictionary<string, object?>
+            {
+                ["name"] = template.Name,
+                ["language"] = new { code = template.Language },
+                ["components"] = new object[]
+                {
+                    new { type = "body", parameters = new[] { new { type = "text", text = code } } },
+                    new { type = "button", sub_type = "url", index = "0", parameters = new[] { new { type = "text", text = code } } },
+                },
+            },
+        };
+        var url = $"https://graph.facebook.com/{settings.ApiVersion}/{Uri.EscapeDataString(settings.PhoneNumberId)}/messages";
+        using var request = new HttpRequestMessage(HttpMethod.Post, url)
+        {
+            Content = new StringContent(JsonSerializer.Serialize(payload, JsonOptions), Encoding.UTF8, "application/json"),
+        };
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", settings.AccessToken);
+        try
+        {
+            var client = _http.CreateClient(HttpClientName);
+            using var response = await client.SendAsync(request, cancellationToken);
+            if (response.IsSuccessStatusCode) return true;
+            var body = await response.Content.ReadAsStringAsync(cancellationToken);
+            _logger.LogWarning("WhatsApp: code template {Template} to {To} failed - HTTP {Status}: {Body}",
+                template.Name, Mask(to), (int)response.StatusCode, Truncate(body, 600));
+            return false;
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            _logger.LogWarning(ex, "WhatsApp: code template {Template} to {To} could not reach graph.facebook.com", template.Name, Mask(to));
+            return false;
+        }
+    }
+
+    /// <summary>
     /// International digits only (no +), or null when it can't be a phone number.
     /// 00971..., +971..., 0501234567 and 501234567 all become 971501234567 for DefaultCountryCode 971.
     /// </summary>
