@@ -216,6 +216,8 @@ try
     builder.Services.AddHostedService<DeploymentWatcher>();
     // SuperAdminPanel database changes: DatabaseScripts\Migrations\NNN_*.sql, run once each at startup (below)
     builder.Services.AddSingleton<SchemaMigrator>();
+    // Website visitor counter (js/bp-visits.js -> api/public/visits, Admin Panel > Website Leads > Visitors)
+    builder.Services.AddSingleton<WebsiteVisitStore>();
 
     var app = builder.Build();
 

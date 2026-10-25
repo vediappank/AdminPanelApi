@@ -101,6 +101,26 @@ public class PublicBlogController : ControllerBase
         return Ok(result);
     }
 
+    /// <summary>Sitemap of every published article - listed in https://blisspointworld.com/robots.txt.</summary>
+    [HttpGet("sitemap.xml")]
+    [ResponseCache(Duration = 3600, Location = ResponseCacheLocation.Any)]
+    public async Task<IActionResult> Sitemap(CancellationToken ct)
+    {
+        var xml = await Cached("sitemap", async () =>
+        {
+            var site = (_config["Website:PublicUrl"] ?? "https://blisspointworld.com").TrimEnd('/');
+            var (rows, _) = await _repo.ListPublicPostsAsync(null, null, null, 1, 5000, ct);
+            var sb = new System.Text.StringBuilder();
+            sb.Append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n");
+            foreach (var r in rows)
+                sb.Append("  <url><loc>").Append(System.Security.SecurityElement.Escape($"{site}/blog/post.html?slug={Uri.EscapeDataString(r.Slug)}"))
+                  .Append("</loc><lastmod>").Append(r.PublishedAt.ToString("yyyy-MM-dd")).Append("</lastmod></url>\n");
+            sb.Append("</urlset>\n");
+            return sb.ToString();
+        });
+        return Content(xml, "application/xml; charset=utf-8");
+    }
+
     [HttpGet("posts/{slug}")]
     public async Task<ActionResult<PublicBlogPostDto>> Post(string slug, CancellationToken ct)
     {
