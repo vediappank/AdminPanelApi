@@ -1,6 +1,7 @@
 using System.Text;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using RenewalTracker.Platform.Infrastructure.Auth;
@@ -15,394 +16,535 @@ try
 {
     var builder = WebApplication.CreateBuilder(args);
 
-    // ---------------------------------------------------------------------
-    // Logging - log4net alongside the default console provider (Console still
-    // shows everything while debugging in Visual Studio; log4net additionally
-    // writes the durable Logs/platform-api.log and Logs/requests.log files -
-    // see log4net.config and RequestResponseLoggingMiddleware).
-    // ---------------------------------------------------------------------
-    // Paths are anchored to the exe folder (AppContext.BaseDirectory), not the process's
-    // current directory: under IIS/Plesk the working directory is not guaranteed to be the
-    // site folder, so relative "log4net.config" / "Logs/..." could resolve somewhere else and
-    // nothing would ever be written. log4net.config reads the folder via %property{LogsDir}.
-    // If log4net cannot open a file (e.g. no write permission on Logs), it reports that on
-    // stderr - visible in Logs\stdout_*.log when stdoutLogEnabled="true" in web.config.
+    ConfigureLogging(builder);
+    ConfigureCoreServices(builder);
+    ConfigureCors(builder);
+    ConfigureRateLimiting(builder);
+    ConfigureApplicationServices(builder);
+
+    var app = builder.Build();
+
+    ApplyDatabaseChanges(app);
+    LogStartupConfiguration(app);
+    LogNotificationConfiguration(app);
+    RegisterProcessDiagnostics(app);
+    StartBackgroundDiagnostics(app);
+
+    ConfigureMiddleware(app);
+    MapEndpoints(app);
+
+    await app.RunAsync();
+}
+catch (Exception ex) when (ex is not HostAbortedException)
+{
+    WriteFatalStartupError(ex);
+    Console.Error.WriteLine(ex);
+    throw;
+}
+
+// -----------------------------------------------------------------------------
+// Service registration
+// -----------------------------------------------------------------------------
+
+static void ConfigureLogging(WebApplicationBuilder builder)
+{
+    // Anchor log paths to the application directory. IIS/Plesk does not guarantee
+    // that the process working directory is the published application directory.
     log4net.GlobalContext.Properties["LogsDir"] = ApiDiagnostics.LogsFolder;
     Directory.CreateDirectory(ApiDiagnostics.LogsFolder);
+
     if (!builder.Environment.IsDevelopment())
     {
-        // On the server the console only feeds the IIS stdout log (no rotation, grows forever) -
-        // keep the durable record in log4net's daily files instead.
+        // Production logs are written to the configured log4net files rather than
+        // an unbounded IIS stdout log.
         builder.Logging.ClearProviders();
     }
+
     builder.Logging.AddLog4Net(Path.Combine(AppContext.BaseDirectory, "log4net.config"));
+}
 
-    // ---------------------------------------------------------------------
-    // Configuration
-    // ---------------------------------------------------------------------
-    builder.Services.Configure<JwtOptions>(builder.Configuration.GetSection(JwtOptions.SectionName));
-    var jwtOptions = builder.Configuration.GetSection(JwtOptions.SectionName).Get<JwtOptions>() ?? new JwtOptions();
+static void ConfigureCoreServices(WebApplicationBuilder builder)
+{
+    var configuration = builder.Configuration;
+    var jwtOptions = configuration.GetSection(JwtOptions.SectionName).Get<JwtOptions>()
+                     ?? new JwtOptions();
 
-    if (string.IsNullOrWhiteSpace(jwtOptions.Key) || Encoding.UTF8.GetByteCount(jwtOptions.Key) < 32)
+    builder.Services.Configure<JwtOptions>(configuration.GetSection(JwtOptions.SectionName));
+
+    if (string.IsNullOrWhiteSpace(jwtOptions.Key) ||
+        Encoding.UTF8.GetByteCount(jwtOptions.Key) < 32)
+    {
         throw new InvalidOperationException(
-            $"Jwt:Key is missing or shorter than 32 characters (environment '{builder.Environment.EnvironmentName}').");
+            $"Jwt:Key is missing or shorter than 32 bytes (environment '{builder.Environment.EnvironmentName}').");
+    }
 
-    if (string.IsNullOrWhiteSpace(builder.Configuration.GetConnectionString("DefaultConnection")))
+    if (string.IsNullOrWhiteSpace(configuration.GetConnectionString("DefaultConnection")))
+    {
         throw new InvalidOperationException("Connection string 'DefaultConnection' is not configured.");
+    }
 
-    // ---------------------------------------------------------------------
-    // EF Core (PlatformDbContext / RenewalTrackerPlatform), platform-operator
-    // identity system, tenant-provisioning client
-    // ---------------------------------------------------------------------
-    builder.Services.AddPlatformInfrastructure(builder.Configuration);
+    builder.Services.AddPlatformInfrastructure(configuration);
 
-    // This bearer scheme only ever validates platform-operator tokens
-    // (PlatformJwtTokenService) - a tenant-user token is issued and validated
-    // exclusively by RenewalTracker.Api now, signed with a different Jwt:Key,
-    // so it fails signature validation here before RequirePlatformAuth even
-    // runs. See PlatformCurrentUserService.IsAuthenticated.
-    builder.Services.AddAuthentication(options =>
-    {
-        options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
-        options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
-    })
-    .AddJwtBearer(options =>
-    {
-        options.TokenValidationParameters = new TokenValidationParameters
+    // This bearer scheme validates platform-operator tokens only. Tenant-user
+    // tokens are issued and validated by RenewalTracker.Api with a different key.
+    builder.Services
+        .AddAuthentication(options =>
         {
-            ValidateIssuer = true,
-            ValidIssuer = jwtOptions.Issuer,
-            ValidateAudience = true,
-            ValidAudience = jwtOptions.Audience,
-            ValidateIssuerSigningKey = true,
-            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtOptions.Key)),
-            ValidateLifetime = true,
-            ClockSkew = TimeSpan.FromMinutes(1),
-        };
-
-        // SignalR (Website Leads live alerts): browsers can't set an
-        // Authorization header on a WebSocket, so the Angular client sends
-        // the same platform JWT as ?access_token=... - accepted ONLY on the
-        // hub path, never for ordinary API calls.
-        options.Events = new JwtBearerEvents
+            options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+            options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+        })
+        .AddJwtBearer(options =>
         {
-            OnMessageReceived = context =>
+            options.TokenValidationParameters = new TokenValidationParameters
             {
-                var accessToken = context.Request.Query["access_token"];
-                if (!string.IsNullOrEmpty(accessToken) && context.HttpContext.Request.Path.StartsWithSegments(WebLeadsHub.Path))
-                    context.Token = accessToken;
-                return Task.CompletedTask;
-            },
-        };
-    });
+                ValidateIssuer = true,
+                ValidIssuer = jwtOptions.Issuer,
+                ValidateAudience = true,
+                ValidAudience = jwtOptions.Audience,
+                ValidateIssuerSigningKey = true,
+                IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtOptions.Key)),
+                ValidateLifetime = true,
+                ClockSkew = TimeSpan.FromMinutes(1)
+            };
+
+            // SignalR clients send the JWT in the query string because browser
+            // WebSocket APIs cannot set an Authorization header. Accept it only
+            // for the Web Leads hub path, never for ordinary API endpoints.
+            options.Events = new JwtBearerEvents
+            {
+                OnMessageReceived = context =>
+                {
+                    var accessToken = context.Request.Query["access_token"];
+                    if (!string.IsNullOrEmpty(accessToken) &&
+                        context.HttpContext.Request.Path.StartsWithSegments(WebLeadsHub.Path))
+                    {
+                        context.Token = accessToken;
+                    }
+
+                    return Task.CompletedTask;
+                }
+            };
+        });
 
     builder.Services.AddAuthorization(options =>
     {
-        // Every endpoint requires a valid JWT unless explicitly [AllowAnonymous]
-        // (login, and the RequireInternalServiceKey-gated internal endpoints,
-        // which authenticate on their own header instead).
-        options.FallbackPolicy = new Microsoft.AspNetCore.Authorization.AuthorizationPolicyBuilder()
+        // All endpoints require authentication unless explicitly marked
+        // [AllowAnonymous]. Internal service-key endpoints authenticate using
+        // their own service-key requirement.
+        options.FallbackPolicy = new AuthorizationPolicyBuilder()
             .RequireAuthenticatedUser()
             .Build();
     });
 
-    // ---------------------------------------------------------------------
-    // MVC / Swagger / CORS
-    // ---------------------------------------------------------------------
-    builder.Services.AddControllers().AddJsonOptions(options =>
-    {
-        options.JsonSerializerOptions.ReferenceHandler = System.Text.Json.Serialization.ReferenceHandler.IgnoreCycles;
-        options.JsonSerializerOptions.DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull;
+    builder.Services.AddControllers()
+        .AddJsonOptions(options =>
+        {
+            options.JsonSerializerOptions.ReferenceHandler =
+                System.Text.Json.Serialization.ReferenceHandler.IgnoreCycles;
+            options.JsonSerializerOptions.DefaultIgnoreCondition =
+                System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull;
 
-        // Tolerate "" for date fields the client sends back but never actually
-        // edits (e.g. EnquiryDto.CreatedDate) - see Json/LenientDateTimeConverters.cs
-        // for why the strict default converter turns that into a 400 on the
-        // whole request instead of just that one field.
-        options.JsonSerializerOptions.Converters.Add(new LenientDateTimeConverter());
-        options.JsonSerializerOptions.Converters.Add(new LenientNullableDateTimeConverter());
-    });
+            // Accept empty strings for date fields that clients send back but do
+            // not edit (for example EnquiryDto.CreatedDate).
+            options.JsonSerializerOptions.Converters.Add(new LenientDateTimeConverter());
+            options.JsonSerializerOptions.Converters.Add(new LenientNullableDateTimeConverter());
+        });
 
     builder.Services.AddEndpointsApiExplorer();
-    builder.Services.AddSwaggerGen(c =>
+    builder.Services.AddSwaggerGen(options =>
     {
-        c.SwaggerDoc("v1", new OpenApiInfo { Title = "Renewal & Reminder Tracker - Platform API", Version = "v1" });
-        var jwtScheme = new OpenApiSecurityScheme
+        options.SwaggerDoc("v1", new OpenApiInfo
+        {
+            Title = "Renewal & Reminder Tracker - Platform API",
+            Version = "v1"
+        });
+
+        options.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
         {
             Name = "Authorization",
             Type = SecuritySchemeType.Http,
             Scheme = "bearer",
             BearerFormat = "JWT",
             In = ParameterLocation.Header,
-            Description = "Paste only the raw JWT (no 'Bearer ' prefix needed here).",
-            Reference = new OpenApiReference { Type = ReferenceType.SecurityScheme, Id = "Bearer" }
-        };
-        c.AddSecurityDefinition("Bearer", jwtScheme);
-        c.AddSecurityRequirement(new OpenApiSecurityRequirement { { jwtScheme, Array.Empty<string>() } });
-    });
+            Description = "Enter the JWT access token."
+        });
 
+        // Use a reference in the requirement so the security scheme is linked
+        // to the definition above without duplicating its metadata.
+        options.AddSecurityRequirement(new OpenApiSecurityRequirement
+        {
+            [new OpenApiSecurityScheme
+            {
+                Reference = new OpenApiReference
+                {
+                    Type = ReferenceType.SecurityScheme,
+                    Id = "Bearer"
+                }
+            }] = Array.Empty<string>()
+        });
+
+        // Avoid schema-ID collisions when different namespaces contain DTOs
+        // with the same class name. This does not hide conflicting API routes.
+        options.CustomSchemaIds(type =>
+            (type.FullName ?? type.Name).Replace("+", "."));
+    });
+}
+
+static void ConfigureCors(WebApplicationBuilder builder)
+{
     var platformOrigins = builder.Configuration.GetSection("Cors:AllowedOrigins").Get<string[]>()
-        ?? new[] { "http://localhost:4300" };
+                          ?? new[] { "http://localhost:4300" };
 
     builder.Services.AddCors(options =>
     {
         options.AddPolicy("PlatformAdminClient", policy =>
         {
             policy.WithOrigins(platformOrigins)
-                  .AllowAnyHeader()
-                  .AllowAnyMethod()
-                  .AllowCredentials();
+                .AllowAnyHeader()
+                .AllowAnyMethod()
+                .AllowCredentials();
         });
     });
 
-    // Website Leads: blisspointgroup.com forms post (anonymously) to
-    // api/public/web-forms/* - see PublicWebFormsController. Only the
-    // website's own origins may call it from a browser.
+    // Public website forms are restricted to the configured website origins.
     var websiteOrigins = builder.Configuration.GetSection("Website:AllowedOrigins").Get<string[]>()
-        ?? new[] { "https://blisspointgroup.com", "https://www.blisspointgroup.com" };
+                         ?? new[]
+                         {
+                             "https://blisspointgroup.com",
+                             "https://www.blisspointgroup.com"
+                         };
 
     builder.Services.AddCors(options =>
     {
         options.AddPolicy(PublicWebFormsController.WebsiteCorsPolicy, policy =>
         {
             policy.WithOrigins(websiteOrigins)
-                  .AllowAnyHeader()
-                  .WithMethods("GET", "POST", "OPTIONS");   // GET: api/public/web-settings
+                .AllowAnyHeader()
+                .WithMethods("GET", "POST", "OPTIONS");
         });
     });
+}
 
-    // Website Leads: at most N submissions per visitor IP per minute
-    // (Website:RateLimitPerMinute, default 10) - stops form-flooding bots.
-    var perMinute = builder.Configuration.GetValue("Website:RateLimitPerMinute", 10);
+static void ConfigureRateLimiting(WebApplicationBuilder builder)
+{
+    var permitLimit = Math.Max(1, builder.Configuration.GetValue("Website:RateLimitPerMinute", 10));
+
     builder.Services.AddRateLimiter(options =>
     {
         options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
-        options.OnRejected = async (context, ct) =>
+        options.OnRejected = async (context, cancellationToken) =>
         {
             context.HttpContext.Response.ContentType = "application/json";
             await context.HttpContext.Response.WriteAsync(
-                "{\"message\":\"Too many submissions from your network. Please wait a minute and try again.\"}", ct);
+                "{\"message\":\"Too many submissions from your network. Please wait a minute and try again.\"}",
+                cancellationToken);
         };
+
         options.AddPolicy(PublicWebFormsController.RateLimitPolicy, httpContext =>
         {
-            var forwarded = httpContext.Request.Headers["X-Forwarded-For"].ToString();
-            var ip = !string.IsNullOrWhiteSpace(forwarded)
-                ? forwarded.Split(',')[0].Trim()
+            var forwardedFor = httpContext.Request.Headers["X-Forwarded-For"].ToString();
+            var clientIp = !string.IsNullOrWhiteSpace(forwardedFor)
+                ? forwardedFor.Split(',')[0].Trim()
                 : httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
-            return RateLimitPartition.GetFixedWindowLimiter(ip, _ => new FixedWindowRateLimiterOptions
-            {
-                PermitLimit = Math.Max(1, perMinute),
-                Window = TimeSpan.FromMinutes(1),
-                QueueLimit = 0,
-            });
+
+            return RateLimitPartition.GetFixedWindowLimiter(
+                clientIp,
+                _ => new FixedWindowRateLimiterOptions
+                {
+                    PermitLimit = permitLimit,
+                    Window = TimeSpan.FromMinutes(1),
+                    QueueLimit = 0
+                });
         });
     });
+}
 
-    // Website Leads: real-time alerts to the Admin Panel (/hubs/web-leads).
+static void ConfigureApplicationServices(WebApplicationBuilder builder)
+{
     builder.Services.AddSignalR();
-    // WhatsApp Business Platform (Cloud API) - new-lead alerts + visitor confirmations ("WhatsApp" section).
-    builder.Services.AddHttpClient(WhatsAppCloud.HttpClientName, c => c.Timeout = TimeSpan.FromSeconds(30));
+
+    builder.Services.AddHttpClient(
+        WhatsAppCloud.HttpClientName,
+        client => client.Timeout = TimeSpan.FromSeconds(30));
     builder.Services.AddSingleton<WhatsAppCloud>();
     builder.Services.AddSingleton<WebLeadNotifier>();
-    // Settings > Email & WhatsApp (dbo.PlatformMessagingSettings) - mailbox for this API's emails, read by the Business Panel API too
+
     builder.Services.AddSingleton<PlatformMessagingStore>();
     builder.Services.AddSingleton<PlatformChatbotStore>();
     builder.Services.AddHostedService<PlatformChatbotSeeder>();
     builder.Services.AddHostedService<PlatformMessagingRefresher>();
-    // Self-check (database objects, Logs folder, origins) - startup log line + GET api/platform/diagnostics
+
     builder.Services.AddSingleton<ApiDiagnostics>();
-    // Settings > Deployments: which build of each site/API is live (version.json written by Deployment\publish-*.ps1)
-    builder.Services.AddHttpClient(DeploymentTracker.HttpClientName, c => c.Timeout = TimeSpan.FromSeconds(10));
+
+    builder.Services.AddHttpClient(
+        DeploymentTracker.HttpClientName,
+        client => client.Timeout = TimeSpan.FromSeconds(10));
     builder.Services.AddSingleton<DeploymentTracker>();
     builder.Services.AddHostedService<DeploymentWatcher>();
-    // SuperAdminPanel database changes: DatabaseScripts\Migrations\NNN_*.sql, run once each at startup (below)
+
     builder.Services.AddSingleton<SchemaMigrator>();
-    // Website visitor counter (js/bp-visits.js -> api/public/visits, Admin Panel > Website Leads > Visitors)
     builder.Services.AddSingleton<WebsiteVisitStore>();
-    // Website sign-up for new posts (email + WhatsApp codes) and the automatic "new posts" messages
-    // (api/public/subscribers, Admin Panel > Website Leads > Subscribers, "Newsletter" section of appsettings)
     builder.Services.AddSingleton<SubscriberStore>();
     builder.Services.AddSingleton<SubscriberMessenger>();
     builder.Services.AddSingleton<NewsletterWorker>();
-    builder.Services.AddHostedService(sp => sp.GetRequiredService<NewsletterWorker>());
+    builder.Services.AddHostedService(serviceProvider =>
+        serviceProvider.GetRequiredService<NewsletterWorker>());
+}
 
-    var app = builder.Build();
+// -----------------------------------------------------------------------------
+// Application initialization and diagnostics
+// -----------------------------------------------------------------------------
 
-    // Columns added after the first release, created before any request so EF never asks for a missing
-    // column: dbo.PlatformUsers.Mobile (optional mobile of a platform user, unique - see
-    // PlatformContactUniquenessService). Same as DatabaseScripts/PlatformUsers_Mobile.sql.
+static void ApplyDatabaseChanges(WebApplication app)
+{
+    // Keep the existing compatibility change for PlatformUsers.Mobile.
+    // Failure is logged but does not prevent the API from starting.
     using (var scope = app.Services.CreateScope())
     {
         try
         {
-            var platformDb = scope.ServiceProvider.GetRequiredService<RenewalTracker.Platform.Infrastructure.Data.PlatformDbContext>();
-            Microsoft.EntityFrameworkCore.RelationalDatabaseFacadeExtensions.ExecuteSqlRaw(platformDb.Database,
-                "IF OBJECT_ID(N'dbo.PlatformUsers', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.PlatformUsers', N'Mobile') IS NULL " +
+            var platformDb = scope.ServiceProvider.GetRequiredService<
+                RenewalTracker.Platform.Infrastructure.Data.PlatformDbContext>();
+
+            Microsoft.EntityFrameworkCore.RelationalDatabaseFacadeExtensions.ExecuteSqlRaw(
+                platformDb.Database,
+                "IF OBJECT_ID(N'dbo.PlatformUsers', N'U') IS NOT NULL " +
+                "AND COL_LENGTH(N'dbo.PlatformUsers', N'Mobile') IS NULL " +
                 "ALTER TABLE dbo.PlatformUsers ADD Mobile NVARCHAR(30) NULL;");
         }
         catch (Exception ex)
         {
-            app.Logger.LogError(ex, "Could not add dbo.PlatformUsers.Mobile - run DatabaseScripts/PlatformUsers_Mobile.sql on SuperAdminPanel");
+            app.Logger.LogError(
+                ex,
+                "Could not add dbo.PlatformUsers.Mobile. Run DatabaseScripts/PlatformUsers_Mobile.sql on SuperAdminPanel.");
         }
     }
 
-    // Database changes shipped with this build (Migrations\NNN_*.sql next to the exe) - each runs once, in order,
-    // recorded in dbo.SchemaMigrations. Never stops the API: a failure is logged and shown on Settings > Deployments.
+    // Apply packaged migrations in order. SchemaMigrator records failures and
+    // reports them in Settings > Deployments.
     app.Services.GetRequiredService<SchemaMigrator>().Run();
+}
 
-    // Temporary startup diagnostic - prints on every boot, regardless of the
-    // Logging:LogLevel config, so a config-resolution problem (env var/user
-    // secret silently overriding appsettings.*.json) is visible immediately in
-    // the console/Logs/platform-api.log without needing to trigger a request
-    // first. Reads "BusinessApiInternal:BaseUrl" (renamed from "BusinessApi:
-    // BaseUrl" - see PlatformInfrastructureRegistration for why). Logs a short
-    // SHA-256 fingerprint of the ServiceKey (not the value) - a length-only
-    // check can't tell two different same-length keys apart, which is exactly
-    // the ambiguity this replaces. Compare this fingerprint against
-    // RenewalTracker.Api's own boot line - identical fingerprint = identical
-    // key. Safe to remove once confirmed stable.
+static void LogStartupConfiguration(WebApplication app)
+{
+    var serviceKey = app.Configuration["Internal:ServiceKey"] ?? string.Empty;
+    var fingerprint = Convert.ToHexString(
+        System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(serviceKey)))[..8];
+
     app.Logger.LogWarning(
         "STARTUP CONFIG CHECK -> Environment={Environment} | BusinessApiInternal:BaseUrl={BusinessApiBaseUrl} | Internal:ServiceKey fingerprint={ServiceKeyFingerprint}",
         app.Environment.EnvironmentName,
         app.Configuration["BusinessApiInternal:BaseUrl"],
-        Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
-            System.Text.Encoding.UTF8.GetBytes(app.Configuration["Internal:ServiceKey"] ?? string.Empty)))[..8]);
+        fingerprint);
 
-    // ---------------------------------------------------------------------
-    // Startup report: where the logs are, and whether everything the API needs is in place.
-    // Problems are logged as warnings, so they appear at the top of Logs/errors.log.
-    // ---------------------------------------------------------------------
-    app.Logger.LogInformation("API starting - environment {Environment}, logs folder {LogsFolder}",
-        app.Environment.EnvironmentName, ApiDiagnostics.LogsFolder);
+    app.Logger.LogInformation(
+        "API starting - environment {Environment}, logs folder {LogsFolder}",
+        app.Environment.EnvironmentName,
+        ApiDiagnostics.LogsFolder);
+}
+
+static void LogNotificationConfiguration(WebApplication app)
+{
+    var smtp = SmtpMail.Read(app.Configuration);
+    var whatsapp = app.Services.GetRequiredService<WhatsAppCloud>().Read();
+    var acknowledgement = bool.TryParse(
+        app.Configuration["Website:SendAcknowledgement"], out var enabled) && !enabled
+        ? "off"
+        : "on";
+
+    app.Logger.LogInformation(
+        "NOTIFICATIONS -> Email: {Email} (host {Host}:{Port}, from {From}, leads to {NotifyEmail}, visitor acknowledgement {Ack}) | WhatsApp: {WhatsApp} (staff numbers {StaffCount}, staff template '{StaffTemplate}', customer template '{CustomerTemplate}')",
+        smtp.IsConfigured ? "ON" : "OFF - set Smtp:Host/UserName/Password",
+        smtp.Host,
+        smtp.Port,
+        smtp.FromEmail,
+        string.IsNullOrWhiteSpace(app.Configuration["Website:NotifyEmail"])
+            ? "(per-form NotifyEmail only)"
+            : app.Configuration["Website:NotifyEmail"],
+        acknowledgement,
+        whatsapp.IsConfigured
+            ? "ON"
+            : whatsapp.Enabled
+                ? "OFF - set WhatsApp:PhoneNumberId/AccessToken"
+                : "OFF",
+        whatsapp.StaffNumbers.Count,
+        whatsapp.StaffTemplate.Name,
+        whatsapp.CustomerTemplate.Name);
+}
+
+static void RegisterProcessDiagnostics(WebApplication app)
+{
+    AppDomain.CurrentDomain.UnhandledException += (_, eventArgs) =>
+        app.Logger.LogCritical(
+            eventArgs.ExceptionObject as Exception,
+            "Unhandled exception - the API process is stopping");
+
+    TaskScheduler.UnobservedTaskException += (_, eventArgs) =>
     {
-        var smtp = SmtpMail.Read(app.Configuration);
-        var wa = app.Services.GetRequiredService<WhatsAppCloud>().Read();
-        app.Logger.LogInformation(
-            "NOTIFICATIONS -> Email: {Email} (host {Host}:{Port}, from {From}, leads to {NotifyEmail}, visitor acknowledgement {Ack}) | WhatsApp: {WhatsApp} (staff numbers {StaffCount}, staff template '{StaffTemplate}', customer template '{CustomerTemplate}')",
-            smtp.IsConfigured ? "ON" : "OFF - set Smtp:Host/UserName/Password", smtp.Host, smtp.Port, smtp.FromEmail,
-            string.IsNullOrWhiteSpace(app.Configuration["Website:NotifyEmail"]) ? "(per-form NotifyEmail only)" : app.Configuration["Website:NotifyEmail"],
-            bool.TryParse(app.Configuration["Website:SendAcknowledgement"], out var ack) && !ack ? "off" : "on",
-            wa.IsConfigured ? "ON" : (wa.Enabled ? "OFF - set WhatsApp:PhoneNumberId/AccessToken" : "OFF"),
-            wa.StaffNumbers.Count, wa.StaffTemplate.Name, wa.CustomerTemplate.Name);
-    }
-    AppDomain.CurrentDomain.UnhandledException += (_, e) =>
-        app.Logger.LogCritical(e.ExceptionObject as Exception, "Unhandled exception - the API process is stopping");
-    TaskScheduler.UnobservedTaskException += (_, e) =>
-    {
-        app.Logger.LogError(e.Exception, "Unobserved background task exception");
-        e.SetObserved();
+        app.Logger.LogError(eventArgs.Exception, "Unobserved background task exception");
+        eventArgs.SetObserved();
     };
+
+    app.Lifetime.ApplicationStopping.Register(
+        () => app.Logger.LogInformation("API stopping"));
+}
+
+static void StartBackgroundDiagnostics(WebApplication app)
+{
     _ = Task.Run(async () =>
     {
         try
         {
             var report = await app.Services.GetRequiredService<ApiDiagnostics>().RunAsync();
+
             if (report.Healthy)
+            {
                 app.Logger.LogInformation(
                     "STARTUP CHECK OK -> database {Server}/{Database} reachable, Website Leads objects present ({Forms} active forms), website origins: {Origins}",
-                    report.DatabaseServer, report.DatabaseName, report.ActiveWebsiteForms, string.Join(", ", report.WebsiteAllowedOrigins));
+                    report.DatabaseServer,
+                    report.DatabaseName,
+                    report.ActiveWebsiteForms,
+                    string.Join(", ", report.WebsiteAllowedOrigins));
+            }
             else
+            {
                 foreach (var problem in report.Problems)
+                {
                     app.Logger.LogWarning("STARTUP CHECK PROBLEM -> {Problem}", problem);
+                }
+            }
         }
         catch (Exception ex)
         {
             app.Logger.LogError(ex, "Startup check could not run");
         }
     });
-    app.Lifetime.ApplicationStopping.Register(() => app.Logger.LogInformation("API stopping"));
+}
 
-    // Swagger: always in Development; in Production only when "Swagger:Enabled": true
+// -----------------------------------------------------------------------------
+// HTTP pipeline and endpoints
+// -----------------------------------------------------------------------------
+
+static void ConfigureMiddleware(WebApplication app)
+{
+    // These must be registered before Swagger so they wrap /swagger/v1/swagger.json
+    // and record the underlying exception instead of returning an unexplained 500.
+    app.UseMiddleware<RequestResponseLoggingMiddleware>();
+    app.UseMiddleware<ExceptionHandlingMiddleware>();
+
+    if (!app.Environment.IsDevelopment())
+    {
+        app.UseHttpsRedirection();
+    }
+
     if (app.Environment.IsDevelopment() || app.Configuration.GetValue("Swagger:Enabled", false))
     {
         app.UseSwagger();
-        app.UseSwaggerUI();
+        app.UseSwaggerUI(options =>
+        {
+            options.SwaggerEndpoint("v1/swagger.json", "RenewalTracker.PlatformApi v1");
+            options.RoutePrefix = "swagger";
+        });
     }
 
-    // Outermost, so it wraps ExceptionHandlingMiddleware and always logs the
-    // true final status code, including a request that failed.
-    app.UseMiddleware<RequestResponseLoggingMiddleware>();
-    app.UseMiddleware<ExceptionHandlingMiddleware>();
-    // Local runs: no http -> https redirect. A browser will not follow a redirect on a CORS pre-check,
-    // so the local website (http://localhost:5291) would otherwise be blocked. Production is unchanged.
-    if (!app.Environment.IsDevelopment())
-        app.UseHttpsRedirection();
-    // Default policy for the Admin Panel; PublicWebFormsController overrides it
-    // with [EnableCors("Website")] (endpoint metadata wins over this default).
+    // CORS must run before authentication/authorization. PublicWebFormsController
+    // selects its own named policy through endpoint metadata.
     app.UseCors("PlatformAdminClient");
     app.UseRateLimiter();
     app.UseAuthentication();
     app.UseAuthorization();
+}
+
+static void MapEndpoints(WebApplication app)
+{
     app.MapControllers();
     app.MapHub<WebLeadsHub>(WebLeadsHub.Path);
 
-    // Root (no auth): opening https://adminpanelapi.givingsign.in/ in a browser goes to Swagger
-    // when it is enabled, otherwise shows a short status instead of a bare 401.
-    var swaggerOn = app.Environment.IsDevelopment() || app.Configuration.GetValue("Swagger:Enabled", false);
-    app.MapGet("/", (IWebHostEnvironment env) => swaggerOn
+    var swaggerEnabled = app.Environment.IsDevelopment() ||
+                         app.Configuration.GetValue("Swagger:Enabled", false);
+
+    app.MapGet("/", (IWebHostEnvironment environment) => swaggerEnabled
             ? Results.Redirect("/swagger")
-            : Results.Ok(new { service = "RenewalTracker.PlatformApi", status = "ok", environment = env.EnvironmentName }))
+            : Results.Ok(new
+            {
+                service = "RenewalTracker.PlatformApi",
+                status = "ok",
+                environment = environment.EnvironmentName
+            }))
         .AllowAnonymous()
         .ExcludeFromDescription();
 
-    // Health check (no auth - bypasses the FallbackPolicy): https://adminpanelapi.givingsign.in/health
-    // https://adminpanelapi.givingsign.in/health?check=true also reports, without secrets, whether the
-    // logs can be written and whether the database answers - for when the logs themselves are missing.
-    app.MapGet("/health", async (IWebHostEnvironment env, bool? check) =>
+    app.MapGet("/health", async (IWebHostEnvironment environment, bool? check) =>
             check == true
-                ? Results.Ok(new { status = "ok", environment = env.EnvironmentName, time = DateTime.Now,
-                                   checks = await app.Services.GetRequiredService<ApiDiagnostics>().QuickCheckAsync() })
-                : Results.Ok(new { status = "ok", environment = env.EnvironmentName, time = DateTime.Now }))
+                ? Results.Ok(new
+                {
+                    status = "ok",
+                    environment = environment.EnvironmentName,
+                    time = DateTime.Now,
+                    checks = await app.Services.GetRequiredService<ApiDiagnostics>().QuickCheckAsync()
+                })
+                : Results.Ok(new
+                {
+                    status = "ok",
+                    environment = environment.EnvironmentName,
+                    time = DateTime.Now
+                }))
         .AllowAnonymous();
 
-    // Build stamp (no auth): https://adminpanelapi.blisspointworld.com/version - version.json is written next to
-    // the exe by Deployment\publish-adminpanelapi.ps1 (app, version, git commit, built at/by), plus start time.
-    // + which DatabaseScripts\Migrations scripts ran on this database (names only) - read by Bliss Deploy's Database tab
-    app.MapGet("/version", (IWebHostEnvironment env, SchemaMigrator migrator) =>
+    app.MapGet("/version", (IWebHostEnvironment environment, SchemaMigrator migrator) =>
+    {
+        var stamp = DeploymentTracker.ReadOwnStamp(DeploymentTracker.SelfKey, environment);
+        var migrationStatus = migrator.Last;
+        var applied = new System.Text.Json.Nodes.JsonArray();
+        var changed = new System.Text.Json.Nodes.JsonArray();
+
+        foreach (var script in migrationStatus.Scripts)
         {
-            var stamp = DeploymentTracker.ReadOwnStamp(DeploymentTracker.SelfKey, env);
-            var m = migrator.Last;
-            var applied = new System.Text.Json.Nodes.JsonArray();
-            var changed = new System.Text.Json.Nodes.JsonArray();
-            foreach (var s in m.Scripts)
+            if (script.Status is "applied" or "changed")
             {
-                if (s.Status is "applied" or "changed") applied.Add(s.Name);
-                if (s.Status == "changed") changed.Add(s.Name);
+                applied.Add(script.Name);
             }
-            stamp["migrations"] = new System.Text.Json.Nodes.JsonObject
+
+            if (script.Status == "changed")
             {
-                ["enabled"] = m.Enabled,
-                ["ranAt"] = m.RanAt,
-                ["applied"] = applied,
-                ["changed"] = changed,
-                ["failed"] = m.Scripts.FirstOrDefault(s => s.Status == "failed")?.Name,
-                ["pending"] = m.Pending,
-            };
-            return Results.Json(stamp);
-        })
+                changed.Add(script.Name);
+            }
+        }
+
+        stamp["migrations"] = new System.Text.Json.Nodes.JsonObject
+        {
+            ["enabled"] = migrationStatus.Enabled,
+            ["ranAt"] = migrationStatus.RanAt,
+            ["applied"] = applied,
+            ["changed"] = changed,
+            ["failed"] = migrationStatus.Scripts
+                .FirstOrDefault(script => script.Status == "failed")?.Name,
+            ["pending"] = migrationStatus.Pending
+        };
+
+        return Results.Json(stamp);
+    })
         .AllowAnonymous()
         .ExcludeFromDescription();
-
-    app.Run();
 }
-catch (Exception ex) when (ex is not HostAbortedException)
+
+static void WriteFatalStartupError(Exception exception)
 {
-    // Write the real startup exception next to the exe so it can be read from Plesk File Manager.
     try
     {
         File.WriteAllText(
             Path.Combine(AppContext.BaseDirectory, "startup-error.txt"),
-            $"{DateTime.Now:O}{Environment.NewLine}{ex}");
-        // ...and into Logs/errors.log, where every other problem is
-        var logs = Path.Combine(AppContext.BaseDirectory, "Logs");
-        Directory.CreateDirectory(logs);
-        File.AppendAllText(Path.Combine(logs, "errors.log"),
-            $"{DateTime.Now:yyyy-MM-dd HH:mm:ss,fff} FATAL Startup - the API could not start: {ex}{Environment.NewLine}");
+            $"{DateTime.Now:O}{Environment.NewLine}{exception}");
+
+        var logsDirectory = Path.Combine(AppContext.BaseDirectory, "Logs");
+        Directory.CreateDirectory(logsDirectory);
+        File.AppendAllText(
+            Path.Combine(logsDirectory, "errors.log"),
+            $"{DateTime.Now:yyyy-MM-dd HH:mm:ss,fff} FATAL Startup - the API could not start: {exception}{Environment.NewLine}");
     }
     catch
     {
-        // no write permission - the stdout log (logs\stdout_*.log) still has it
+        // If the application directory is not writable, the hosting stdout log
+        // remains the fallback location for startup exceptions.
     }
-
-    Console.Error.WriteLine(ex);
-    throw;
 }
