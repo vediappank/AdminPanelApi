@@ -160,9 +160,22 @@ public class PlatformBlogController : ControllerBase
         if (!BlogContent.HasImageSignature(bytes, ext)) return BadRequest(new { message = "That file is not a real image." });
 
         var folder = BlogContent.ImageFolder(_config, _env);
-        Directory.CreateDirectory(folder);
         var name = $"{DateTime.UtcNow:yyyyMM}_{Guid.NewGuid():N}{(ext == ".jpeg" ? ".jpg" : ext)}";
-        await System.IO.File.WriteAllBytesAsync(Path.Combine(folder, name), bytes, ct);
+        try
+        {
+            Directory.CreateDirectory(folder);
+            await System.IO.File.WriteAllBytesAsync(Path.Combine(folder, name), bytes, ct);
+        }
+        catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or NotSupportedException or ArgumentException)
+        {
+            // Usually the app pool identity has no write permission on the folder, or Website:BlogImagePath is wrong.
+            _logger.LogError(ex, "Blog image could not be saved to {Folder}", folder);
+            return StatusCode(StatusCodes.Status500InternalServerError, new
+            {
+                message = "The server could not save the image. Ask your administrator to check that the blog image folder exists and the API has permission to write to it. "
+                          + $"(Folder: {folder}. Reason: {ex.GetType().Name} - {ex.Message})"
+            });
+        }
 
         return Ok(new BlogImageUploadResult { FileName = name, Url = PublicBlogController.ImageUrl(Request, _config, name)! });
     }
