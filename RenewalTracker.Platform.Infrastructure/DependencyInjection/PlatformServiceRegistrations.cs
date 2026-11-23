@@ -32,5 +32,8 @@ public static class PlatformServiceRegistrations
 
         // Website Blog - posts and categories shown on the website (dbo.BlogPost / dbo.BlogCategory).
         services.AddScoped<IBlogRepository, BlogRepository>();
+
+        // Website chatbot questions and answers (dbo.WebsiteChatbotQa).
+        services.AddScoped<IChatbotQaRepository, ChatbotQaRepository>();
     }
 }
