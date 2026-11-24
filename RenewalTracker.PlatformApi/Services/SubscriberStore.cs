@@ -110,10 +110,12 @@ public sealed partial class SubscriberStore
         public DateTime? ActivatedAt { get; set; }
         public DateTime? LastLoginAt { get; set; }
         public DateTime? UnsubscribedAt { get; set; }
+        public string? Username { get; set; }
+        public DateTime? PasswordSetAt { get; set; }
     }
 
     private const string Columns = @"SubscriberId, Name, Email, WhatsApp, Language, Status, EmailVerifiedAt, WhatsAppVerifiedAt, EmailOptIn, WhatsAppOptIn,
-ConsentAt, UnsubscribeToken, EmailFailures, Source, CreatedAt, ActivatedAt, LastLoginAt, UnsubscribedAt";
+ConsentAt, UnsubscribeToken, EmailFailures, Source, CreatedAt, ActivatedAt, LastLoginAt, UnsubscribedAt, Username, PasswordSetAt";
 
     public async Task<Subscriber?> GetAsync(int id, CancellationToken ct)
     {
@@ -196,6 +198,8 @@ VALUES (@ticket, @subscriberId, @purpose, @eh, @wh, @pendingName, @pendingWhatsA
         public string? PendingName { get; set; }
         public string? PendingWhatsApp { get; set; }
         public string? PendingLanguage { get; set; }
+        public string? PendingPasswordHash { get; set; }
+        public string? PendingUsername { get; set; }
         public int Attempts { get; set; }
         public DateTime ExpiresAt { get; set; }
         public DateTime? CompletedAt { get; set; }
@@ -261,6 +265,160 @@ WHERE SubscriberId = @id;",
         await using var cn = Open();
         await cn.ExecuteAsync(Cmd(@"UPDATE dbo.WebsiteSubscribers SET WhatsApp = COALESCE(@whatsapp, WhatsApp), WhatsAppVerifiedAt = SYSUTCDATETIME(),
 WhatsAppOptIn = 1, UpdatedAt = SYSUTCDATETIME() WHERE SubscriberId = @id", new { id = c.SubscriberId, whatsapp = c.PendingWhatsApp }, ct));
+    }
+
+    // ------------------------------------------------------------------ passwords + usernames (migration 006)
+    // Password login is an addition: the email / WhatsApp code login above keeps working. A password is only ever stored
+    // as PBKDF2 (210,000 rounds, random salt) and is applied only after the person proves the email with a code.
+
+    public const int PasswordMinLength = 8;
+    public const int MaxFailedLogins = 5;
+    public const int LockMinutes = 15;
+    private const int Pbkdf2Rounds = 210_000;
+    private const string DummyHash = "pbkdf2$210000$AAAAAAAAAAAAAAAAAAAAAA==$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+    [GeneratedRegex(@"^[a-z0-9][a-z0-9._-]{2,29}$")]
+    private static partial Regex UsernameRule();
+
+    /// <summary>3-30 characters: letters, digits, dot, underscore, dash. Returns lower-case or null.</summary>
+    public static string? CleanUsername(string? username)
+    {
+        var u = (username ?? string.Empty).Trim().ToLowerInvariant();
+        return UsernameRule().IsMatch(u) ? u : null;
+    }
+
+    public static string? PasswordProblem(string? password)
+    {
+        if (string.IsNullOrEmpty(password) || password.Length < PasswordMinLength) return $"Your password needs at least {PasswordMinLength} characters.";
+        if (password.Length > 100) return "Your password is too long (100 characters at most).";
+        if (!password.Any(char.IsLetter) || !password.Any(char.IsDigit)) return "Please use letters and at least one number in your password.";
+        return null;
+    }
+
+    public static string HashPassword(string password)
+    {
+        var salt = RandomNumberGenerator.GetBytes(16);
+        var hash = Rfc2898DeriveBytes.Pbkdf2(Encoding.UTF8.GetBytes(password), salt, Pbkdf2Rounds, HashAlgorithmName.SHA256, 32);
+        return $"pbkdf2${Pbkdf2Rounds}${Convert.ToBase64String(salt)}${Convert.ToBase64String(hash)}";
+    }
+
+    public static bool CheckPassword(string password, string? stored)
+    {
+        try
+        {
+            var p = (stored ?? DummyHash).Split('$');
+            if (p.Length != 4 || p[0] != "pbkdf2") return false;
+            var expected = Convert.FromBase64String(p[3]);
+            var actual = Rfc2898DeriveBytes.Pbkdf2(Encoding.UTF8.GetBytes(password ?? string.Empty), Convert.FromBase64String(p[2]), int.Parse(p[1]), HashAlgorithmName.SHA256, expected.Length);
+            return CryptographicOperations.FixedTimeEquals(actual, expected) && stored != null;
+        }
+        catch { return false; }
+    }
+
+    public sealed class LoginRow
+    {
+        public int SubscriberId { get; set; }
+        public string? PasswordHash { get; set; }
+        public int FailedLogins { get; set; }
+        public DateTime? LockedUntil { get; set; }
+        public DateTime? EmailVerifiedAt { get; set; }
+        public DateTime? WhatsAppVerifiedAt { get; set; }
+    }
+
+    /// <summary>identifier = email, verified WhatsApp number (digits) or username - whichever the person typed.</summary>
+    public async Task<LoginRow?> FindLoginAsync(string? email, string? phoneDigits, string? username, CancellationToken ct)
+    {
+        await using var cn = Open();
+        const string cols = "SubscriberId, PasswordHash, FailedLogins, LockedUntil, EmailVerifiedAt, WhatsAppVerifiedAt";
+        if (email != null)
+            return await cn.QuerySingleOrDefaultAsync<LoginRow>(Cmd($"SELECT {cols} FROM dbo.WebsiteSubscribers WHERE Email = @email", new { email }, ct));
+        if (username != null)
+            return await cn.QuerySingleOrDefaultAsync<LoginRow>(Cmd($"SELECT {cols} FROM dbo.WebsiteSubscribers WHERE Username = @username", new { username }, ct));
+        if (phoneDigits != null)
+        {
+            var rows = (await cn.QueryAsync<LoginRow>(Cmd($"SELECT TOP (2) {cols} FROM dbo.WebsiteSubscribers WHERE WhatsApp = @phoneDigits AND WhatsAppVerifiedAt IS NOT NULL AND PasswordHash IS NOT NULL", new { phoneDigits }, ct))).ToList();
+            return rows.Count == 1 ? rows[0] : null;   // two accounts on one number: use the email instead
+        }
+        return null;
+    }
+
+    public async Task RecordLoginResultAsync(int id, bool ok, CancellationToken ct)
+    {
+        await using var cn = Open();
+        await cn.ExecuteAsync(Cmd(ok
+            ? "UPDATE dbo.WebsiteSubscribers SET FailedLogins = 0, LockedUntil = NULL WHERE SubscriberId = @id AND (FailedLogins <> 0 OR LockedUntil IS NOT NULL)"
+            : @"UPDATE dbo.WebsiteSubscribers SET FailedLogins = FailedLogins + 1,
+                   LockedUntil = CASE WHEN FailedLogins + 1 >= @max THEN DATEADD(MINUTE, @mins, SYSUTCDATETIME()) ELSE LockedUntil END
+                WHERE SubscriberId = @id", new { id, max = MaxFailedLogins, mins = LockMinutes }, ct));
+    }
+
+    /// <summary>Row for this email for a password sign-up: created with updates OFF (a chat account is not a newsletter sign-up).</summary>
+    public async Task<Subscriber> EnsureAccountAsync(string email, string name, string language, string? source, CancellationToken ct)
+    {
+        await using var cn = Open();
+        await cn.ExecuteAsync(Cmd(@"
+IF NOT EXISTS (SELECT 1 FROM dbo.WebsiteSubscribers WHERE Email = @email)
+    INSERT dbo.WebsiteSubscribers (Name, Email, Language, UnsubscribeToken, Source, EmailOptIn, WhatsAppOptIn)
+    VALUES (@name, @email, @language, @token, @source, 0, 0);",
+            new { email, name, language, token = NewToken(), source = source?.Length > 300 ? source[..300] : source }, ct));
+        return await cn.QuerySingleAsync<Subscriber>(Cmd($"SELECT {Columns} FROM dbo.WebsiteSubscribers WHERE Email = @email", new { email }, ct));
+    }
+
+    public async Task<bool> UsernameFreeAsync(string username, int exceptId, CancellationToken ct)
+    {
+        await using var cn = Open();
+        return await cn.ExecuteScalarAsync<int>(Cmd("SELECT COUNT(*) FROM dbo.WebsiteSubscribers WHERE Username = @username AND SubscriberId <> @exceptId", new { username, exceptId }, ct)) == 0;
+    }
+
+    /// <summary>Keeps the password (already hashed) and username with the code attempt until the email code is right.</summary>
+    public async Task SetChallengePendingAsync(string ticket, string passwordHash, string? username, CancellationToken ct)
+    {
+        await using var cn = Open();
+        await cn.ExecuteAsync(Cmd("UPDATE dbo.SubscriberChallenges SET PendingPasswordHash = @passwordHash, PendingUsername = @username WHERE Ticket = @ticket",
+            new { ticket, passwordHash, username }, ct));
+    }
+
+    /// <summary>Email code right: email verified, password + username applied. A taken username is skipped (never blocks the account).</summary>
+    public async Task<bool> ApplyAccountAsync(Challenge c, CancellationToken ct)
+    {
+        await using var cn = Open();
+        var usernameOk = c.PendingUsername != null && await UsernameFreeAsync(c.PendingUsername, c.SubscriberId, ct);
+        await cn.ExecuteAsync(Cmd(@"
+UPDATE dbo.WebsiteSubscribers SET
+    Name = COALESCE(NULLIF(@name, N''), Name),
+    EmailVerifiedAt = COALESCE(EmailVerifiedAt, SYSUTCDATETIME()),
+    WhatsApp = CASE WHEN @waOk = 1 THEN @whatsapp ELSE WhatsApp END,
+    WhatsAppVerifiedAt = CASE WHEN @waOk = 1 THEN SYSUTCDATETIME() ELSE WhatsAppVerifiedAt END,
+    PasswordHash = COALESCE(@hash, PasswordHash), PasswordSetAt = CASE WHEN @hash IS NULL THEN PasswordSetAt ELSE SYSUTCDATETIME() END,
+    Username = CASE WHEN @username IS NOT NULL THEN @username ELSE Username END,
+    FailedLogins = 0, LockedUntil = NULL, UpdatedAt = SYSUTCDATETIME()
+WHERE SubscriberId = @id;",
+            new { id = c.SubscriberId, name = c.PendingName, whatsapp = c.PendingWhatsApp, waOk = c.WhatsAppCodeHash != null ? 1 : 0, hash = c.PendingPasswordHash, username = usernameOk ? c.PendingUsername : null }, ct));
+        return c.PendingUsername == null || usernameOk;
+    }
+
+    public sealed class Credentials { public string? Username { get; set; } public bool HasPassword { get; set; } }
+
+    public async Task<Credentials> CredentialsAsync(int id, CancellationToken ct)
+    {
+        await using var cn = Open();
+        return await cn.QuerySingleAsync<Credentials>(Cmd("SELECT Username, CAST(CASE WHEN PasswordHash IS NULL THEN 0 ELSE 1 END AS BIT) AS HasPassword FROM dbo.WebsiteSubscribers WHERE SubscriberId = @id", new { id }, ct));
+    }
+
+    /// <summary>Logged-in person changes username and / or password. Returns an error text or null.</summary>
+    public async Task<string?> UpdateCredentialsAsync(int id, string? username, string? currentPassword, string? newPassword, CancellationToken ct)
+    {
+        await using var cn = Open();
+        var stored = await cn.ExecuteScalarAsync<string?>(Cmd("SELECT PasswordHash FROM dbo.WebsiteSubscribers WHERE SubscriberId = @id", new { id }, ct));
+        // changing an existing password needs the old one - a borrowed phone with a saved session cannot lock the owner out
+        if (stored != null && newPassword != null && !CheckPassword(currentPassword ?? string.Empty, stored)) return "Your current password is not correct.";
+        if (username != null && !await UsernameFreeAsync(username, id, ct)) return "That username is already taken. Please choose another.";
+        await cn.ExecuteAsync(Cmd(@"
+UPDATE dbo.WebsiteSubscribers SET Username = COALESCE(@username, Username),
+    PasswordHash = COALESCE(@hash, PasswordHash), PasswordSetAt = CASE WHEN @hash IS NULL THEN PasswordSetAt ELSE SYSUTCDATETIME() END,
+    UpdatedAt = SYSUTCDATETIME() WHERE SubscriberId = @id;",
+            new { id, username, hash = newPassword == null ? null : HashPassword(newPassword) }, ct));
+        return null;
     }
 
     // ------------------------------------------------------------------ sessions

@@ -286,6 +286,7 @@ static void ConfigureApplicationServices(WebApplicationBuilder builder)
     builder.Services.AddSingleton<WebsiteVisitStore>();
     builder.Services.AddSingleton<SubscriberStore>();
     builder.Services.AddSingleton<SubscriberMessenger>();
+    builder.Services.AddSingleton<ChatLeadStore>();
     builder.Services.AddSingleton<NewsletterWorker>();
     builder.Services.AddHostedService(serviceProvider =>
         serviceProvider.GetRequiredService<NewsletterWorker>());

@@ -17,6 +17,10 @@ namespace RenewalTracker.PlatformApi.Controllers;
 ///   POST api/public/subscribers/verify                  { ticket, emailCode, whatsappCode } -> { session } (signed up + logged in)
 ///   POST api/public/subscribers/login                   { identifier }  email or WhatsApp number -> code sent; { ticket, channel, to }
 ///   POST api/public/subscribers/login/verify            { ticket, code } -> { session }
+///   POST api/public/subscribers/account/signup         { name, email, whatsapp, username?, language?, website } -> email + WhatsApp codes sent; { ticket, email, whatsapp, needsWhatsAppCode }
+///   POST api/public/subscribers/account/verify         { ticket, emailCode, whatsappCode } -> { session, profile }  (email + WhatsApp proven = signed up and logged in)
+///   POST api/public/subscribers/me/credentials         { username } -> profile
+///   GET  api/public/subscribers/chat-identity          header X-BP-Session -> { loggedIn, name, email, phone, username } (for the AI chat)
 ///   POST api/public/subscribers/resend                  { ticket } -> new codes, new ticket
 ///   GET  api/public/subscribers/me                      header X-BP-Session -> profile
 ///   POST api/public/subscribers/me                      { name, language, emailOptIn, whatsappOptIn } -> profile
@@ -57,6 +61,10 @@ public class PublicSubscribersController : ControllerBase
     public sealed record PreferencesRequest(string? Name, string? Language, bool EmailOptIn, bool WhatsAppOptIn);
     public sealed record WhatsAppRequest(string? WhatsApp);
     public sealed record UnsubscribeRequest(string? Token, string? Channel);
+    public sealed record AccountVerifyRequest(string? Ticket, string? EmailCode, string? WhatsAppCode);
+    public sealed record AccountSignupRequest(string? Name, string? Email, string? WhatsApp, string? Username, string? Language, string? Source, string? Website);
+    public sealed record AccountLoginRequest(string? Identifier, string? Password, string? Website);
+    public sealed record CredentialsRequest(string? Username, string? CurrentPassword, string? NewPassword);
 
     private string Ip
     {
@@ -161,6 +169,7 @@ public class PublicSubscribersController : ControllerBase
         var fresh = await _store.CreateChallengeAsync(c.SubscriberId, c.Purpose,
             emailCode: c.EmailCodeHash != null, whatsappCode: c.WhatsAppCodeHash != null && _messenger.WhatsAppReady,
             c.PendingName, c.PendingWhatsApp, c.PendingLanguage, Ip, ct);
+        if (c.PendingPasswordHash != null) await _store.SetChallengePendingAsync(fresh.Ticket, c.PendingPasswordHash, c.PendingUsername, ct);
         await _messenger.SendCodesAsync(c.PendingName ?? person.Name, person.Email, waTo, c.PendingLanguage ?? person.Language,
             fresh.EmailCode, fresh.WhatsAppCode, ct);
         return Ok(new { ticket = fresh.Ticket });
@@ -174,17 +183,25 @@ public class PublicSubscribersController : ControllerBase
     {
         var id = (req.Identifier ?? string.Empty).Trim();
         var email = SubscriberStore.CleanEmail(id);
-        var phone = email == null ? Digits(id) : null;
-        if (email == null && phone == null) return Problem400("Enter the email address or WhatsApp number you signed up with.");
-        var channel = email != null ? "email" : "whatsapp";
-        var to = email != null ? SubscriberStore.MaskEmail(email) : SubscriberStore.MaskPhone(phone);
+        var looksLikePhone = email == null && id.Count(char.IsDigit) >= 7 && id.All(ch => char.IsDigit(ch) || " +-()".Contains(ch));
+        var phone = looksLikePhone ? Digits(id) : null;
+        var username = email == null && phone == null ? SubscriberStore.CleanUsername(id) : null;
+        if (email == null && phone == null && username == null) return Problem400("Enter the email address, mobile number or username you signed up with.");
+        var channel = phone != null ? "whatsapp" : "email";   // a username gets its code by email
+        var to = email != null ? SubscriberStore.MaskEmail(email) : phone != null ? SubscriberStore.MaskPhone(phone) : "your registered email";
         var fakeTicket = new { ticket = SubscriberStore.NewToken(), channel, to };
         if (!string.IsNullOrWhiteSpace(req.Website)) return Ok(fakeTicket);
         if (channel == "whatsapp" && !_messenger.WhatsAppReady)
             return Problem400("Please log in with your email address.");
         if (!_store.AllowIp(Ip)) return TooMany();
 
-        var person = await _store.FindAsync(email, phone, ct);
+        SubscriberStore.Subscriber? person;
+        if (username != null)
+        {
+            var row = await _store.FindLoginAsync(null, null, username, ct);
+            person = row == null ? null : await _store.GetAsync(row.SubscriberId, ct);
+        }
+        else person = await _store.FindAsync(email, phone, ct);
         // not registered (or never confirmed): the same answer, nothing sent - nobody can test which addresses are signed up
         if (person == null || person.EmailVerifiedAt == null) return Ok(fakeTicket);
         if (await _store.ChallengesLastHourAsync(person.SubscriberId, ct) >= SubscriberStore.MaxChallengesPerPersonPerHour) return TooMany();
@@ -215,6 +232,85 @@ public class PublicSubscribersController : ControllerBase
         return Ok(new { session, profile = Profile(person!) });
     }
 
+
+    // ------------------------------------------------------------------ account: password sign-up / login (migration 006)
+
+    private const string BadLogin = "The details are not correct. Please check them or use the email code login.";
+
+    [HttpPost("api/public/subscribers/account/signup")]
+    [Microsoft.AspNetCore.RateLimiting.EnableRateLimiting(PublicWebFormsController.RateLimitPolicy)]
+    public async Task<IActionResult> AccountSignup([FromBody] AccountSignupRequest req, CancellationToken ct)
+    {
+        var name = SubscriberStore.CleanName(req.Name);
+        var email = SubscriberStore.CleanEmail(req.Email);
+        var language = SubscriberStore.CleanLanguage(req.Language);
+        string? username = null;
+        if (!string.IsNullOrWhiteSpace(req.Username))
+        {
+            username = SubscriberStore.CleanUsername(req.Username);
+            if (username == null) return Problem400("Username: 3-30 characters, letters, numbers, dot, dash or underscore.");
+        }
+        if (name.Length < 2) return Problem400("Please enter your name.");
+        if (email == null) return Problem400("Please enter a valid email address.");
+        var whatsapp = Digits(req.WhatsApp);
+        if (whatsapp == null) return Problem400("Please enter a valid WhatsApp number with country code, e.g. +971 50 123 4567.");
+        var needWa = _messenger.WhatsAppReady;
+        // never reveals whether the email already has an account: the same answer, and the code proves who owns the address
+        if (!string.IsNullOrWhiteSpace(req.Website)) return Ok(new { ticket = SubscriberStore.NewToken(), email = SubscriberStore.MaskEmail(email), whatsapp = SubscriberStore.MaskPhone(whatsapp), needsWhatsAppCode = needWa });
+        if (!_messenger.EmailReady) return StatusCode(503, new { message = "Sign-up is not available right now. Please contact us on WhatsApp." });
+        if (!_store.AllowIp(Ip)) return TooMany();
+        if (username != null)
+        {
+            var mine = await _store.FindAsync(email, null, ct);
+            if (!await _store.UsernameFreeAsync(username, mine?.SubscriberId ?? 0, ct)) return Problem400("That username is already taken. Please choose another.");
+        }
+
+        var person = await _store.EnsureAccountAsync(email, name, language, req.Source, ct);
+        if (await _store.ChallengesLastHourAsync(person.SubscriberId, ct) >= SubscriberStore.MaxChallengesPerPersonPerHour) return TooMany();
+        var c = await _store.CreateChallengeAsync(person.SubscriberId, "account", emailCode: true, whatsappCode: needWa, name, whatsapp, language, Ip, ct);
+        await _store.SetChallengePendingAsync(c.Ticket, null, username, ct);
+        var sent = await _messenger.SendCodesAsync(name, email, whatsapp, language, c.EmailCode, c.WhatsAppCode, ct);
+        if (!sent.Email) return StatusCode(502, new { message = "We could not send the email code. Please check the address and try again." });
+        if (needWa && !sent.WhatsApp) return StatusCode(502, new { message = "We could not send the WhatsApp code. Please check the number (with country code) and try again." });
+        return Ok(new { ticket = c.Ticket, email = SubscriberStore.MaskEmail(email), whatsapp = SubscriberStore.MaskPhone(whatsapp), needsWhatsAppCode = needWa });
+    }
+
+    [HttpPost("api/public/subscribers/account/verify")]
+    public async Task<IActionResult> AccountVerify([FromBody] AccountVerifyRequest req, CancellationToken ct)
+    {
+        var c = await _store.GetChallengeAsync(req.Ticket ?? string.Empty, ct);
+        if (c == null || c.Purpose != "account") return Problem400("This sign-up has expired. Please start again.");
+        var result = await _store.CheckCodesAsync(c, (req.EmailCode ?? string.Empty).Trim(), (req.WhatsAppCode ?? string.Empty).Trim(), ct);
+        if (result != SubscriberStore.CheckResult.Ok)
+            return Problem400(result == SubscriberStore.CheckResult.Wrong ? (c.WhatsAppCodeHash != null ? "One of the codes is not correct. Please check both and try again." : "The code is not correct. Please try again.")
+                : result == SubscriberStore.CheckResult.TooManyTries ? "Too many wrong tries. Please start again." : "The code has expired. Please start again.");
+        var usernameSaved = await _store.ApplyAccountAsync(c, ct);
+        var session = await _store.CreateSessionAsync(c.SubscriberId, ct);
+        var person = await _store.GetAsync(c.SubscriberId, ct);
+        return Ok(new { session, profile = Profile(person!), usernameSaved });
+    }
+
+    [HttpPost("api/public/subscribers/me/credentials")]
+    public async Task<IActionResult> SaveCredentials([FromBody] CredentialsRequest req, CancellationToken ct)
+    {
+        var me = await MeAsync(ct);
+        if (me == null) return Unauthorized(new { message = "Please log in." });
+        var username = SubscriberStore.CleanUsername(req.Username);
+        if (username == null) return Problem400("Username: 3-30 characters, letters, numbers, dot, dash or underscore.");
+        if (!_store.AllowIp(Ip)) return TooMany();
+        var error = await _store.UpdateCredentialsAsync(me.SubscriberId, username, null, null, ct);
+        return error != null ? Problem400(error) : Ok(Profile((await _store.GetAsync(me.SubscriberId, ct))!));
+    }
+
+    /// <summary>For the AI chat (n8n): who is this visitor? Guests get loggedIn=false - the chat stays open to everyone.</summary>
+    [HttpGet("api/public/subscribers/chat-identity")]
+    public async Task<IActionResult> ChatIdentity(CancellationToken ct)
+    {
+        var me = await MeAsync(ct);
+        if (me == null) return Ok(new { loggedIn = false });
+        return Ok(new { loggedIn = true, name = me.Name, email = me.Email, phone = me.WhatsApp == null ? null : "+" + me.WhatsApp, username = me.Username });
+    }
+
     // ------------------------------------------------------------------ my account
 
     private async Task<SubscriberStore.Subscriber?> MeAsync(CancellationToken ct) =>
@@ -222,7 +318,7 @@ public class PublicSubscribersController : ControllerBase
 
     private object Profile(SubscriberStore.Subscriber s) => new
     {
-        s.Name, s.Email, whatsapp = s.WhatsApp == null ? null : "+" + s.WhatsApp, s.Language, s.Status,
+        s.Name, s.Email, s.Username, whatsapp = s.WhatsApp == null ? null : "+" + s.WhatsApp, s.Language, s.Status,
         emailVerified = s.EmailVerifiedAt != null, whatsappVerified = s.WhatsAppVerifiedAt != null,
         s.EmailOptIn, s.WhatsAppOptIn, memberSince = s.ActivatedAt ?? s.CreatedAt,
         whatsappAvailable = _messenger.WhatsAppReady,
