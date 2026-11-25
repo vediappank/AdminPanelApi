@@ -129,4 +129,86 @@ SELECT DATEADD(HOUR, @hours, SYSUTCDATETIME());",
             commandType: System.Data.CommandType.StoredProcedure, commandTimeout: 30, cancellationToken: ct));
         return null;
     }
+
+    // ------------------------------------------------------------------ Admin Panel (staff)
+
+    public sealed class TaskRow
+    {
+        public long WebChatTaskId { get; set; }
+        public long WebEnquiryId { get; set; }
+        public string ReferenceNo { get; set; } = string.Empty;
+        public string FullName { get; set; } = string.Empty;
+        public string Email { get; set; } = string.Empty;
+        public string Phone { get; set; } = string.Empty;
+        public string? ServiceInterest { get; set; }
+        public string TaskType { get; set; } = string.Empty;
+        public string? Note { get; set; }
+        public DateTime DueAt { get; set; }
+        public string Status { get; set; } = "Open";
+        public DateTime CreatedAt { get; set; }
+        public DateTime? CompletedAt { get; set; }
+        public bool Overdue { get; set; }
+    }
+
+    public async Task<List<TaskRow>> ListTasksAsync(string? status, string? type, int take, CancellationToken ct)
+    {
+        await using var cn = Open();
+        return (await cn.QueryAsync<TaskRow>(Cmd(@"
+SELECT TOP (@take) t.WebChatTaskId, t.WebEnquiryId, e.ReferenceNo, e.FullName, e.Email, e.Phone, e.ServiceInterest, t.TaskType, t.Note, t.DueAt, t.Status,
+       t.CreatedAt, t.CompletedAt, CAST(CASE WHEN t.Status = 'Open' AND t.DueAt < SYSUTCDATETIME() THEN 1 ELSE 0 END AS BIT) AS Overdue
+FROM dbo.WebChatTask t JOIN dbo.WebEnquiry e ON e.WebEnquiryId = t.WebEnquiryId
+WHERE (@status IS NULL OR t.Status = @status) AND (@type IS NULL OR t.TaskType = @type)
+ORDER BY CASE t.Status WHEN 'Open' THEN 0 ELSE 1 END, t.DueAt, t.WebChatTaskId",
+            new { take = Math.Clamp(take, 1, 500), status, type }, ct))).ToList();
+    }
+
+    public sealed class TaskStats { public int Open { get; set; } public int Overdue { get; set; } public int DueToday { get; set; } }
+
+    public async Task<TaskStats> TaskStatsAsync(CancellationToken ct)
+    {
+        await using var cn = Open();
+        return await cn.QuerySingleAsync<TaskStats>(Cmd(@"
+SELECT ISNULL(SUM(CASE WHEN Status = 'Open' THEN 1 ELSE 0 END), 0) AS [Open],
+       ISNULL(SUM(CASE WHEN Status = 'Open' AND DueAt < SYSUTCDATETIME() THEN 1 ELSE 0 END), 0) AS Overdue,
+       ISNULL(SUM(CASE WHEN Status = 'Open' AND CAST(DueAt AS DATE) = CAST(SYSUTCDATETIME() AS DATE) THEN 1 ELSE 0 END), 0) AS DueToday
+FROM dbo.WebChatTask", null, ct));
+    }
+
+    public async Task<bool> CompleteTaskAsync(long taskId, string by, CancellationToken ct)
+    {
+        await using var cn = Open();
+        var enq = await cn.ExecuteScalarAsync<long?>(Cmd(@"
+UPDATE dbo.WebChatTask SET Status = 'Done', CompletedAt = SYSUTCDATETIME() OUTPUT inserted.WebEnquiryId WHERE WebChatTaskId = @taskId AND Status = 'Open'", new { taskId }, ct));
+        if (enq == null) return false;
+        await cn.ExecuteAsync(Cmd(@"INSERT dbo.WebStatusHistory (EntityType, EntityId, FromStatus, ToStatus, Note, ChangedBy)
+SELECT 'Enquiry', WebEnquiryId, Status, Status, N'Chat follow-up task completed', @by FROM dbo.WebEnquiry WHERE WebEnquiryId = @enq", new { enq, by = Cut(by, 100) }, ct));
+        return true;
+    }
+
+    public sealed class QuestionRow { public string Question { get; set; } = string.Empty; public bool Matched { get; set; } public DateTime CreatedAt { get; set; } }
+    public sealed class ChatSummary
+    {
+        public string? ServiceInterest { get; set; }
+        public string? DraftService { get; set; }
+        public string? DraftSummary { get; set; }
+        public DateTime? DraftAt { get; set; }
+        public DateTime? QuotationRequestedAt { get; set; }
+        public string? Decision { get; set; }
+        public DateTime? DecisionAt { get; set; }
+    }
+
+    /// <summary>Everything the chat recorded for one website lead (null when the lead has no chat journey).</summary>
+    public async Task<object?> ChatDetailAsync(long webEnquiryId, CancellationToken ct)
+    {
+        await using var cn = Open();
+        using var m = await cn.QueryMultipleAsync(Cmd(@"
+SELECT ServiceInterest, DraftService, DraftSummary, DraftAt, QuotationRequestedAt, Decision, DecisionAt FROM dbo.WebChatLead WHERE WebEnquiryId = @webEnquiryId;
+SELECT Question, Matched, CreatedAt FROM dbo.WebChatQuestion WHERE WebEnquiryId = @webEnquiryId ORDER BY CreatedAt, WebChatQuestionId;
+SELECT t.WebChatTaskId, t.WebEnquiryId, e.ReferenceNo, e.FullName, e.Email, e.Phone, e.ServiceInterest, t.TaskType, t.Note, t.DueAt, t.Status, t.CreatedAt, t.CompletedAt,
+       CAST(CASE WHEN t.Status = 'Open' AND t.DueAt < SYSUTCDATETIME() THEN 1 ELSE 0 END AS BIT) AS Overdue
+FROM dbo.WebChatTask t JOIN dbo.WebEnquiry e ON e.WebEnquiryId = t.WebEnquiryId WHERE t.WebEnquiryId = @webEnquiryId ORDER BY t.WebChatTaskId;", new { webEnquiryId }, ct));
+        var chat = await m.ReadSingleOrDefaultAsync<ChatSummary>();
+        if (chat == null) return null;
+        return new { chat, questions = (await m.ReadAsync<QuestionRow>()).ToList(), tasks = (await m.ReadAsync<TaskRow>()).ToList() };
+    }
 }
