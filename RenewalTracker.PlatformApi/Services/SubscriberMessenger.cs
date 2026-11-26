@@ -11,7 +11,7 @@ namespace RenewalTracker.PlatformApi.Services;
 ///   Enabled          false = no automatic "new posts" messages (sign-up still works)
 ///   FromName         sender name, default "Bliss Point Group Updates"
 ///   ReplyTo          replies go here, default Website:NotifyEmail
-///   SendFromHour / SendToHour   UAE hours the automatic message may go out (default 9 and 20)
+///   SendFromHour / SendToHour   UAE hours the automatic message may go out (default 10 and 11: the daily update email goes out at 10 AM)
 ///   Smtp             { Host, Port, EnableSsl, UserName, Password, FromEmail } - any SMTP service (Brevo, Amazon SES,
 ///                    Mailgun, SendGrid, Office 365 ...). Empty Host = the API's normal mailbox (Settings > Email & WhatsApp / "Smtp").
 ///   WhatsApp         { Enabled, OtpTemplate, NewPostsTemplate, WelcomeTemplate, ArabicSuffix, WebhookVerifyToken, AppSecret }
@@ -40,8 +40,8 @@ public sealed class SubscriberMessenger
 
     private IConfigurationSection N => _config.GetSection("Newsletter");
     public bool AutoSendEnabled => !bool.TryParse(N["Enabled"], out var on) || on;
-    public int SendFromHour => Math.Clamp(N.GetValue("SendFromHour", 9), 0, 23);
-    public int SendToHour => Math.Clamp(N.GetValue("SendToHour", 20), 1, 24);
+    public int SendFromHour => Math.Clamp(N.GetValue("SendFromHour", 10), 0, 23);
+    public int SendToHour => Math.Clamp(N.GetValue("SendToHour", 11), 1, 24);
     public string WebsiteUrl => (_config["Website:PublicUrl"] ?? "https://blisspointworld.com").TrimEnd('/');
     public string ApiUrl => (_config["Website:ApiPublicUrl"] ?? "https://adminpanelapi.blisspointworld.com").TrimEnd('/');
     private string Phone => _config["Website:ContactPhone"] ?? "+971 4 454 0091";
@@ -68,6 +68,9 @@ public sealed class SubscriberMessenger
     }
 
     public bool EmailReady => Smtp().IsConfigured;
+
+    /// <summary>The reason the last email failed (shown to the developer only, when running in Development).</summary>
+    public string? LastEmailError { get; private set; }
 
     private (WhatsAppCloud.Settings Account, IConfigurationSection Cfg) Wa() => (_whatsApp.Read(), N.GetSection("WhatsApp"));
 
@@ -191,6 +194,7 @@ public sealed class SubscriberMessenger
         if (!smtp.IsConfigured)
         {
             _logger.LogWarning("Subscribers: no SMTP mailbox set (Newsletter:Smtp or Smtp) - email to {To} not sent", Mask(to));
+            LastEmailError = "no SMTP mailbox is configured (Smtp:Host / UserName / Password)";
             return (false, false);
         }
         try
@@ -201,11 +205,13 @@ public sealed class SubscriberMessenger
         catch (SmtpFailedRecipientException ex)
         {
             _logger.LogWarning(ex, "Subscribers: the mail server refused {To}", Mask(to));
+            LastEmailError = "the mail server refused the address: " + ex.GetBaseException().Message;
             return (false, true);
         }
         catch (Exception ex) when (ex is SmtpException or InvalidOperationException or FormatException or IOException)
         {
             _logger.LogWarning(ex, "Subscribers: email to {To} failed", Mask(to));
+            LastEmailError = ex.GetBaseException().Message;
             return (false, ex is FormatException);
         }
     }

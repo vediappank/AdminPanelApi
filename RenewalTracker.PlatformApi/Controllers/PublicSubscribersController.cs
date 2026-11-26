@@ -55,7 +55,7 @@ public class PublicSubscribersController : ControllerBase
 
     public sealed record SignupRequest(string? Name, string? Email, string? WhatsApp, string? Language, bool Consent, string? Source, string? Website);
     public sealed record VerifyRequest(string? Ticket, string? EmailCode, string? WhatsAppCode);
-    public sealed record LoginRequest(string? Identifier, string? Website);
+    public sealed record LoginRequest(string? Identifier, string? Website, string? Name = null, string? Phone = null);
     public sealed record LoginVerifyRequest(string? Ticket, string? Code);
     public sealed record TicketRequest(string? Ticket);
     public sealed record PreferencesRequest(string? Name, string? Language, bool EmailOptIn, bool WhatsAppOptIn);
@@ -120,11 +120,17 @@ public class PublicSubscribersController : ControllerBase
         var challenge = await _store.CreateChallengeAsync(person.SubscriberId, "signup", emailCode: true, whatsappCode: needWa,
             name, whatsapp, language, Ip, ct);
         var sent = await _messenger.SendCodesAsync(name, email, whatsapp, language, challenge.EmailCode, challenge.WhatsAppCode, ct);
-        if (!sent.Email) return StatusCode(502, new { message = "We could not send the email code. Please check the address and try again." });
+        if (!sent.Email) return StatusCode(502, new { message = EmailFailMessage() });
         if (needWa && !sent.WhatsApp) return StatusCode(502, new { message = "We could not send the WhatsApp code. Please check the number (with country code) and try again." });
 
         return Ok(new { ticket = challenge.Ticket, email = SubscriberStore.MaskEmail(email), whatsapp = SubscriberStore.MaskPhone(whatsapp), needsWhatsAppCode = needWa });
     }
+
+    // In Development the real SMTP reason is added to the message, so a mail problem can be fixed without digging in the log.
+    private string EmailFailMessage() =>
+        "We could not send the email code. Please check the address and try again."
+        + (string.Equals(Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT"), "Development", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(_messenger.LastEmailError)
+            ? " [Development: " + _messenger.LastEmailError + "]" : "");
 
     [HttpPost("api/public/subscribers/verify")]
     public async Task<IActionResult> Verify([FromBody] VerifyRequest req, CancellationToken ct)
@@ -204,6 +210,9 @@ public class PublicSubscribersController : ControllerBase
         else person = await _store.FindAsync(email, phone, ct);
         // not registered (or never confirmed): the same answer, nothing sent - nobody can test which addresses are signed up
         if (person == null || person.EmailVerifiedAt == null) return Ok(fakeTicket);
+        // optional extra proof from the chat sign-in form: name and mobile number must match the saved record
+        if (!string.IsNullOrWhiteSpace(req.Phone) && Digits(req.Phone) != Digits(person.WhatsApp ?? string.Empty)) return Ok(fakeTicket);
+        if (!string.IsNullOrWhiteSpace(req.Name) && !string.Equals(req.Name.Trim(), (person.Name ?? string.Empty).Trim(), StringComparison.OrdinalIgnoreCase)) return Ok(fakeTicket);
         if (await _store.ChallengesLastHourAsync(person.SubscriberId, ct) >= SubscriberStore.MaxChallengesPerPersonPerHour) return TooMany();
 
         var c = await _store.CreateChallengeAsync(person.SubscriberId, "login", emailCode: channel == "email", whatsappCode: channel == "whatsapp",
@@ -270,7 +279,7 @@ public class PublicSubscribersController : ControllerBase
         var c = await _store.CreateChallengeAsync(person.SubscriberId, "account", emailCode: true, whatsappCode: needWa, name, whatsapp, language, Ip, ct);
         await _store.SetChallengePendingAsync(c.Ticket, null, username, ct);
         var sent = await _messenger.SendCodesAsync(name, email, whatsapp, language, c.EmailCode, c.WhatsAppCode, ct);
-        if (!sent.Email) return StatusCode(502, new { message = "We could not send the email code. Please check the address and try again." });
+        if (!sent.Email) return StatusCode(502, new { message = EmailFailMessage() });
         if (needWa && !sent.WhatsApp) return StatusCode(502, new { message = "We could not send the WhatsApp code. Please check the number (with country code) and try again." });
         return Ok(new { ticket = c.Ticket, email = SubscriberStore.MaskEmail(email), whatsapp = SubscriberStore.MaskPhone(whatsapp), needsWhatsAppCode = needWa });
     }

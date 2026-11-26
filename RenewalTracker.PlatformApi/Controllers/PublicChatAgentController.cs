@@ -9,7 +9,7 @@ namespace RenewalTracker.PlatformApi.Controllers;
 /// <summary>
 /// The website chat window talks to the AI assistant here (js/bp-chat.js):
 ///   POST api/public/chat/message   { sessionId, message }   optional header X-BP-Session (the signed-in visitor)
-///   -> { output }   or 503 { message } when no AI provider could answer (the widget then falls back to the FAQ answers).
+///   -> { output }   or 401 when the visitor is not signed in (verified), or 503 { message } when no AI provider could answer (the widget then falls back to the FAQ answers).
 /// Limits (in memory, per network and per chat session) keep AI usage and cost under control.
 /// </summary>
 [ApiController]
@@ -24,7 +24,8 @@ public class PublicChatAgentController : ControllerBase
     private static readonly ConcurrentDictionary<string, (int Count, DateTime Start)> Hits = new();
 
     private readonly ChatAgentService _agent;
-    public PublicChatAgentController(ChatAgentService agent) => _agent = agent;
+    private readonly SubscriberStore _subscribers;
+    public PublicChatAgentController(ChatAgentService agent, SubscriberStore subscribers) { _agent = agent; _subscribers = subscribers; }
 
     public sealed record MessageRequest(string? SessionId, string? Message);
 
@@ -39,6 +40,10 @@ public class PublicChatAgentController : ControllerBase
     [HttpPost("message")]
     public async Task<IActionResult> Message([FromBody] MessageRequest req, CancellationToken ct)
     {
+        // The chat is for signed-in visitors whose email is verified (sign-up needs the email code before a session exists).
+        var visitor = await _subscribers.FromSessionAsync(Request.Headers[PublicSubscribersController.SessionHeader].ToString().Trim(), ct);
+        if (visitor == null || visitor.EmailVerifiedAt == null)
+            return StatusCode(401, new { needsLogin = true, message = "Please sign in to chat." });
         if (!_agent.Ready) return StatusCode(503, new { message = "The assistant is not available right now." });
         var text = (req.Message ?? string.Empty).Trim();
         if (text.Length == 0) return BadRequest(new { message = "Please type your question." });

@@ -44,6 +44,7 @@ HOW YOU WORK
 - Company facts, contact routes, typical prices and timelines come ONLY from the tool get_company_info (call it with the topic, e.g. "business setup mainland", "accounting VAT", "typing attestation", "contact"). Approved Q&A wording comes from get_faq. UAE government updates come from get_latest_updates.
 - For Visa & Immigration Services (family visa, employment visa and their sub-services) get prices from get_service_prices, never from memory. Ask what is needed (how many people, inside or outside the UAE, medical, Emirates ID), pick only the lines that apply (never both Inside Visa and Outside Visa for the same person), then call get_price_estimate with those serviceIds and the number of people. Show the lines and totals exactly as returned, in AED, say it is an estimate from the current price list and the team confirms the final quotation. Never add or multiply numbers yourself.
 - Never invent prices, fees, timelines, requirements or legal advice. If you do not have it, say so and offer a team follow-up.
+- If the visitor asks who you are or what you can do: you are the Bliss Point Group website assistant. You help with company setup, PRO services, visas, attestation, legal translation and document clearing, then offer one next step. Answer identity questions yourself; never use an admin-panel FAQ for them.
 
 CONVERSATION FLOW - answer first, then convert
 A. ANSWER FIRST. Every question gets a real, useful answer straight away. Never hold an answer back until the visitor signs in or gives contact details. If the exact figure is not published, give what is known (timeline, process, documents, what affects the cost) and say a quotation gives the final price.
@@ -116,6 +117,11 @@ RULES
     private static string Json(object o) => JsonSerializer.Serialize(o, Web);
     private static string Cut(string s, int n) => s.Length > n ? s[..n] : s;
 
+    // Common words that match almost any FAQ text and must not decide which FAQ is used.
+    private static readonly HashSet<string> StopWords = new(StringComparer.OrdinalIgnoreCase) { "who", "what", "when", "where", "which", "how", "why", "are", "you", "the", "and", "for", "can", "does", "your", "this", "that", "with", "have", "has", "was", "will", "would", "should", "could", "about", "tell", "please", "there", "their", "them", "they", "its", "into", "from", "much", "many", "need", "want", "get" };
+    // Whole words only, so 'who' does not match inside 'whole'.
+    private static HashSet<string> Tokens(string s) => new(System.Text.RegularExpressions.Regex.Split(s.ToLowerInvariant(), @"[^\p{L}\p{N}]+").Where(t => t.Length > 0), StringComparer.OrdinalIgnoreCase);
+
     private string Needs(string what) => Json(new { ok = false, needsLogin = true, message = "The visitor is not signed in (email and WhatsApp verified). Ask them to sign in or create an account in the chat and end your reply with [[LOGIN]]. " + what });
 
     private async Task<string> GetUrlAsync(string url, int max, CancellationToken ct)
@@ -144,9 +150,9 @@ RULES
                 using var scope = _scopes.CreateScope();
                 var rows = await scope.ServiceProvider.GetRequiredService<IChatbotQaRepository>().ListPublishedAsync(ct);
                 var list = JsonNode.Parse(Json(rows))?.AsArray() ?? new JsonArray();
-                var words = S("query").ToLowerInvariant().Split(' ', StringSplitOptions.RemoveEmptyEntries).Where(w => w.Length > 2).ToList();
-                var ranked = list.Select(n => (Row: n!, Score: words.Count(w => (n!["question"] + " " + n["answer"] + " " + n["category"]).ToLowerInvariant().Contains(w))))
-                    .OrderByDescending(x => x.Score).Take(words.Count == 0 ? 0 : 6).Where(x => x.Score > 0).ToList();
+                var words = S("query").ToLowerInvariant().Split(' ', StringSplitOptions.RemoveEmptyEntries).Where(w => w.Length > 2 && !StopWords.Contains(w)).ToList();
+                var ranked = list.Select(n => (Row: n!, Score: words.Count(w => Tokens(n!["question"] + " " + n["answer"] + " " + n["category"]).Contains(w))))
+                    .OrderByDescending(x => x.Score).Take(words.Count == 0 ? 0 : 6).Where(x => x.Score >= Math.Min(2, words.Count)).ToList();
                 var sb = new StringBuilder();
                 if (ranked.Count == 0) sb.Append("No close match. Published topics: ").Append(string.Join(", ", list.Select(n => n!["category"]?.ToString()).Distinct()));
                 else foreach (var r in ranked) sb.Append("Q: ").Append(r.Row["question"]).Append("\nA: ").Append(r.Row["answer"]).Append("\n\n");
