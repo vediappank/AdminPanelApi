@@ -287,12 +287,6 @@ static void ConfigureApplicationServices(WebApplicationBuilder builder)
     builder.Services.AddSingleton<SubscriberStore>();
     builder.Services.AddSingleton<SubscriberMessenger>();
     builder.Services.AddSingleton<ChatLeadStore>();
-    builder.Services.AddHttpClient(
-        LlmClient.HttpClientName,
-        client => client.Timeout = TimeSpan.FromSeconds(40));
-    builder.Services.AddSingleton<ChatMemoryStore>();
-    builder.Services.AddSingleton<LlmClient>();
-    builder.Services.AddSingleton<ChatAgentService>();
     builder.Services.AddSingleton<NewsletterWorker>();
     builder.Services.AddHostedService(serviceProvider =>
         serviceProvider.GetRequiredService<NewsletterWorker>());

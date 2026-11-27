@@ -108,9 +108,7 @@ public class PublicSubscribersController : ControllerBase
         if (!req.Consent) return Problem400("Please tick the box to agree to receive updates.");
 
         var needWa = _messenger.WhatsAppReady;
-        // honeypot filled = a bot: answer like a real sign-up, send nothing
-        if (!string.IsNullOrWhiteSpace(req.Website))
-            return Ok(new { ticket = SubscriberStore.NewToken(), email = SubscriberStore.MaskEmail(email), whatsapp = SubscriberStore.MaskPhone(whatsapp), needsWhatsAppCode = needWa });
+        // no bot-trap check here: browsers autofill hidden fields and blocked real visitors; the rate limits below protect this endpoint
         if (!_messenger.EmailReady) return StatusCode(503, new { message = "Sign-up is not available right now. Please contact us on WhatsApp." });
         if (!_store.AllowIp(Ip)) return TooMany();
 
@@ -196,7 +194,7 @@ public class PublicSubscribersController : ControllerBase
         var channel = phone != null ? "whatsapp" : "email";   // a username gets its code by email
         var to = email != null ? SubscriberStore.MaskEmail(email) : phone != null ? SubscriberStore.MaskPhone(phone) : "your registered email";
         var fakeTicket = new { ticket = SubscriberStore.NewToken(), channel, to };
-        if (!string.IsNullOrWhiteSpace(req.Website)) return Ok(fakeTicket);
+        // no bot-trap check here (browsers autofill hidden fields); the rate limit and the per-person limit apply
         if (channel == "whatsapp" && !_messenger.WhatsAppReady)
             return Problem400("Please log in with your email address.");
         if (!_store.AllowIp(Ip)) return TooMany();
@@ -265,7 +263,7 @@ public class PublicSubscribersController : ControllerBase
         if (whatsapp == null) return Problem400("Please enter a valid WhatsApp number with country code, e.g. +971 50 123 4567.");
         var needWa = _messenger.WhatsAppReady;
         // never reveals whether the email already has an account: the same answer, and the code proves who owns the address
-        if (!string.IsNullOrWhiteSpace(req.Website)) return Ok(new { ticket = SubscriberStore.NewToken(), email = SubscriberStore.MaskEmail(email), whatsapp = SubscriberStore.MaskPhone(whatsapp), needsWhatsAppCode = needWa });
+        // (no bot-trap check: browsers autofill hidden fields; the rate limit and the per-person limit protect this endpoint)
         if (!_messenger.EmailReady) return StatusCode(503, new { message = "Sign-up is not available right now. Please contact us on WhatsApp." });
         if (!_store.AllowIp(Ip)) return TooMany();
         if (username != null)
